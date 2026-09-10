@@ -90,6 +90,8 @@ class FakeHass:
     def __init__(self) -> None:
         self.bus = FakeBus()
         self.config_entries = FakeConfigEntries()
+        # The `device_unreachable` outage clock lives here, keyed by address.
+        self.data: dict = {}
 
 
 class FakeEntry:

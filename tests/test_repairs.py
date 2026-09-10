@@ -38,6 +38,7 @@ import custom_components.bedjet.repairs as repairs_module
 from custom_components.bedjet.repairs import BleRecoveryFixFlow, async_create_fix_flow
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import CONF_ADDRESS, CONF_ENTITY_ID
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
 
 # Live values, read off the running instance on 2026-09-09: the BedJet at this
@@ -88,27 +89,6 @@ class FakeIssueRegistry:
         self.issues.pop(issue_id, None)
 
 
-class FakeTimers:
-    """Stand-in for `async_call_later`, so a test decides when time passes."""
-
-    def __init__(self) -> None:
-        self.scheduled: list[tuple[float, Any]] = []
-
-    def call_later(self, hass, delay, action):
-        item = (delay, action)
-        self.scheduled.append(item)
-
-        def _cancel() -> None:
-            if item in self.scheduled:
-                self.scheduled.remove(item)
-
-        return _cancel
-
-    def fire(self) -> None:
-        _delay, action = self.scheduled.pop()
-        action(None)
-
-
 class FakeClock:
     """Monotonic clock the test winds forward by hand."""
 
@@ -120,6 +100,49 @@ class FakeClock:
 
     def advance(self, seconds: float) -> None:
         self.seconds += seconds
+
+
+class FakeTimers:
+    """Stand-in for `async_call_later`, so a test decides when time passes.
+
+    Each timer is stored by its absolute deadline on the fake clock, not by
+    the delay it was armed with: the failure this file exists to catch is a
+    countdown re-armed for a fresh full window on every reload, and a fake
+    that fired whatever was scheduled, whenever asked, could not tell that
+    apart from the right behaviour.
+    """
+
+    def __init__(self, clock: FakeClock) -> None:
+        self._clock = clock
+        self.scheduled: list[tuple[float, Any]] = []
+
+    @property
+    def due(self) -> list[float]:
+        """Absolute deadlines of every pending timer."""
+        return [due for due, _action in self.scheduled]
+
+    def call_later(self, hass, delay, action):
+        item = (self._clock() + delay, action)
+        self.scheduled.append(item)
+
+        def _cancel() -> None:
+            if item in self.scheduled:
+                self.scheduled.remove(item)
+
+        return _cancel
+
+    def fire(self) -> None:
+        """Fire the last-armed timer regardless of its deadline."""
+        _due, action = self.scheduled.pop()
+        action(None)
+
+    def fire_due(self) -> None:
+        """Fire every timer whose deadline the clock has reached."""
+        now = self._clock()
+        ready = [item for item in self.scheduled if item[0] <= now]
+        for item in ready:
+            self.scheduled.remove(item)
+            item[1](None)
 
 
 class FakeDevice:
@@ -203,6 +226,7 @@ class FakeHass:
         self.bus = FakeBus()
         self.config_entries = FakeConfigEntries()
         self.services = FakeServices(esphome_actions)
+        self.data: dict[str, Any] = {}
 
 
 class FakeEntry:
@@ -229,16 +253,16 @@ def registry(monkeypatch) -> FakeIssueRegistry:
 
 
 @pytest.fixture
-def timers(monkeypatch) -> FakeTimers:
-    fake = FakeTimers()
-    monkeypatch.setattr(coordinator_module, "async_call_later", fake.call_later)
+def clock(monkeypatch) -> FakeClock:
+    fake = FakeClock()
+    monkeypatch.setattr(coordinator_module, "monotonic", fake)
     return fake
 
 
 @pytest.fixture
-def clock(monkeypatch) -> FakeClock:
-    fake = FakeClock()
-    monkeypatch.setattr(coordinator_module, "monotonic", fake)
+def timers(monkeypatch, clock) -> FakeTimers:
+    fake = FakeTimers(clock)
+    monkeypatch.setattr(coordinator_module, "async_call_later", fake.call_later)
     return fake
 
 
@@ -300,19 +324,43 @@ def _collapse_wizard_waiting(monkeypatch) -> None:
 
 
 def run_setup(
-    monkeypatch, hass: FakeHass, entry: FakeEntry, device: FakeDevice
+    monkeypatch,
+    hass: FakeHass,
+    entry: FakeEntry,
+    device: FakeDevice,
+    *,
+    seen: bool = True,
 ) -> bool:
-    """Run async_setup_entry against a prepared device."""
+    """Run async_setup_entry against a prepared device.
+
+    `seen=False` is the one not-ready case: Bluetooth has never heard this
+    address, so there is no service info to build a device from.
+    """
     monkeypatch.setattr(bedjet_init, "BedJet", lambda *args, **kwargs: device)
     monkeypatch.setattr(
         bedjet_init.bluetooth,
         "async_last_service_info",
-        lambda hass, address, connectable=True: SERVICE_INFO,
+        lambda hass, address, connectable=True: SERVICE_INFO if seen else None,
     )
     monkeypatch.setattr(
         bedjet_init.bluetooth, "async_register_callback", lambda *a, **k: lambda: None
     )
     return asyncio.run(bedjet_init.async_setup_entry(hass, entry))
+
+
+def reload(monkeypatch, hass: FakeHass, entry: FakeEntry) -> FakeDevice:
+    """Reload the entry the way Home Assistant does: unload, then set up afresh.
+
+    Returns the new `BedJet` the fresh setup built. It is not streaming yet,
+    exactly as in production: `start()` only spawns the connect loop.
+    """
+    asyncio.run(bedjet_init.async_unload_entry(hass, entry))
+    asyncio.run(entry.runtime_data.async_shutdown())
+    entry.state = ConfigEntryState.NOT_LOADED
+    device = FakeDevice(available=False)
+    assert run_setup(monkeypatch, hass, entry, device) is True
+    entry.state = ConfigEntryState.LOADED
+    return device
 
 
 def make_coordinator(
@@ -367,8 +415,8 @@ class TestUnreachableIssue:
         self, registry, timers, clock, holding_proxy
     ) -> None:
         # The same rule at the unit level, in the state a post-reload
-        # coordinator is in: healthy link, `_down_since` still None, no memory
-        # of an issue. Reality is the only input the delete is allowed to have.
+        # coordinator is in: healthy link, no outage on record, no memory of
+        # an issue. Reality is the only input the delete is allowed to have.
         hass = FakeHass()
         make_coordinator(hass, FakeEntry(), FakeDevice(available=True, connected=True))
         registry.issues[ISSUE_ID] = {}
@@ -389,7 +437,7 @@ class TestUnreachableIssue:
         run_setup(monkeypatch, hass, FakeEntry(), FakeDevice(available=False))
 
         assert ISSUE_ID in registry.issues
-        assert [delay for delay, _action in timers.scheduled] == [UNREACHABLE_GRACE_S]
+        assert timers.due == [UNREACHABLE_GRACE_S]
 
     def test_issue_is_raised_only_once_the_grace_period_has_fully_elapsed(
         self, registry, timers, clock, no_holding_proxy
@@ -442,18 +490,136 @@ class TestUnreachableIssue:
 
         assert ISSUE_ID in registry.issues
 
-    def test_unloading_drops_the_pending_countdown(
+    def test_reloads_inside_the_window_do_not_restart_the_countdown(
+        self, monkeypatch, registry, timers, clock, no_holding_proxy
+    ) -> None:
+        """The measured failure, replayed: the repair never came.
+
+        Live instance, 2026-09-09, a deliberate 21-minute power cut of a
+        sibling BLE device that the household autoheal sweep also dispatches
+        to - it reloads any entry whose link is down every 5 minutes:
+
+            22:24:37  link drop       -> countdown armed
+            22:35:00  autoheal reload -> fresh coordinator, countdown at zero
+            22:40:00  autoheal reload -> fresh coordinator, countdown at zero
+
+        Anything measured by an object the entry owns restarts on every one
+        of those reloads, so 15 continuous minutes can never be observed for
+        as long as the device is down. The deadline must stay where the
+        first drop put it, and the issue must be open 15 minutes after that
+        drop - not 15 minutes after the last reload.
+        """
+        hass = FakeHass()
+        entry = FakeEntry()
+        hass.config_entries.entries.append(entry)
+        device = FakeDevice(available=True, connected=True)
+        assert run_setup(monkeypatch, hass, entry, device) is True
+
+        device.available = False
+        device.connected = False
+        device.push()
+        dropped_at = clock()
+        assert registry.issues == {}
+
+        for _sweep in range(2):
+            clock.advance(5 * 60)
+            reload(monkeypatch, hass, entry)
+            assert registry.issues == {}, "10 minutes is not yet 15"
+            assert timers.due == [dropped_at + UNREACHABLE_GRACE_S], (
+                "a reload must neither restart the countdown nor add a second one"
+            )
+
+        clock.advance(5 * 60)
+        timers.fire_due()
+
+        assert ISSUE_ID in registry.issues
+
+    def test_a_device_bluetooth_never_hears_gets_the_repair(
+        self, monkeypatch, registry, timers, clock, no_holding_proxy
+    ) -> None:
+        """The not-ready path: the most total outage, and the one never covered.
+
+        A device that stopped advertising has no service info, so setup
+        raises `ConfigEntryNotReady` before a coordinator exists; anything a
+        coordinator would have armed never starts. Home Assistant retries
+        setup on a backoff for as long as that lasts (a sibling integration's
+        entry sat in `setup_retry` overnight this way on 2026-09-09), so the
+        countdown started on the first attempt must survive every retry and
+        the retries must not move its deadline.
+        """
+        hass = FakeHass()
+        entry = FakeEntry()
+        hass.config_entries.entries.append(entry)
+        first_attempt = clock()
+        for backoff in (0, 10, 20, 40, 80):
+            clock.advance(backoff)
+            with pytest.raises(ConfigEntryNotReady):
+                run_setup(monkeypatch, hass, entry, FakeDevice(), seen=False)
+            entry.state = ConfigEntryState.SETUP_RETRY
+            assert timers.due == [first_attempt + UNREACHABLE_GRACE_S]
+        assert registry.issues == {}
+
+        clock.seconds = first_attempt + UNREACHABLE_GRACE_S
+        timers.fire_due()
+
+        assert ISSUE_ID in registry.issues
+
+        # The device reappears: the retry that finally succeeds builds a
+        # coordinator, and its first frame is what clears the repair.
+        device = FakeDevice(available=False)
+        assert run_setup(monkeypatch, hass, entry, device) is True
+        entry.state = ConfigEntryState.LOADED
+        assert ISSUE_ID in registry.issues, "setup must not pretend an outage ended"
+        device.available = True
+        device.connected = True
+        device.push()
+
+        assert registry.issues == {}
+        assert timers.scheduled == []
+
+    def test_a_deadline_firing_after_unload_raises_nothing(
         self, registry, timers, clock, no_holding_proxy
     ) -> None:
-        # A deadline firing after unload would raise an issue whose Fix button
-        # has nothing left to act on.
+        # The countdown outlives the entry on purpose (that is what makes it
+        # reload-proof), so what must hold instead is that a deadline reached
+        # while the entry is not loaded raises no issue whose Fix button has
+        # nothing left to act on.
         hass = FakeHass()
-        coordinator = make_coordinator(hass, FakeEntry(), FakeDevice(available=False))
+        entry = FakeEntry()
+        coordinator = make_coordinator(hass, entry, FakeDevice(available=False))
         coordinator.async_reconcile_unreachable_issue()
 
         asyncio.run(coordinator.async_shutdown())
+        entry.state = ConfigEntryState.NOT_LOADED
+        clock.advance(UNREACHABLE_GRACE_S)
+        timers.fire_due()
 
-        assert timers.scheduled == []
+        assert registry.issues == {}
+
+    def test_removing_the_entry_forgets_the_outage(
+        self, monkeypatch, registry, timers, clock, no_holding_proxy
+    ) -> None:
+        # Removal is the one lifecycle event that must forget the clock: the
+        # same address set up again later is a new device, not a 20-minute
+        # outage, and no deadline may fire for an entry that is gone.
+        monkeypatch.setattr(bedjet_init, "ir", registry)
+        hass = FakeHass()
+        entry = FakeEntry()
+        coordinator = make_coordinator(hass, entry, FakeDevice(available=False))
+        coordinator.async_reconcile_unreachable_issue()
+        clock.advance(UNREACHABLE_GRACE_S + 5 * 60)
+
+        asyncio.run(bedjet_init.async_remove_entry(hass, entry))
+        hass.config_entries.entries.clear()
+        timers.fire_due()
+        assert registry.issues == {}
+
+        make_coordinator(
+            hass, FakeEntry(), FakeDevice(available=False)
+        ).async_reconcile_unreachable_issue()
+
+        assert registry.issues == {}
+        assert timers.due == [clock() + UNREACHABLE_GRACE_S]
 
 
 class TestHoldingProxyMemory:

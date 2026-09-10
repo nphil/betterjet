@@ -10,9 +10,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
-from .coordinator import BedJetCoordinator
+from .const import DOMAIN
+from .coordinator import (
+    BedJetCoordinator,
+    async_forget_link,
+    async_reconcile_link,
+    unreachable_issue_id,
+)
 from .pybedjet import BedJet
 
 PLATFORMS: list[Platform] = [
@@ -44,11 +51,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
 
     ConfigEntryNotReady is only raised for the one case more waiting cannot
     fix: this address has never been seen by Home Assistant's Bluetooth
-    stack at all, so there is no BLEDevice to connect to yet.
+    stack at all, so there is no BLEDevice to connect to yet. That is also
+    the most total outage there is, so the `device_unreachable` countdown is
+    started *before* the raise: nothing after it runs, Home Assistant retries
+    setup on a backoff for as long as the device stays silent, and a
+    countdown that only started once setup succeeded would never start at
+    all: a sibling BLE integration's entry (the living-room vent fan) sat in
+    `setup_retry` overnight on 2026-09-09 with no repair for exactly this
+    reason. The countdown is idempotent per address, so those retries cannot
+    push its deadline out.
     """
     address: str = entry.data[CONF_ADDRESS]
     service_info = bluetooth.async_last_service_info(hass, address, connectable=True)
     if service_info is None:
+        async_reconcile_link(hass, address, entry.title, healthy=False)
         raise ConfigEntryNotReady(
             f"BedJet {address} has not been seen by Bluetooth yet"
         )
@@ -116,3 +132,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> b
     if unload_ok:
         await entry.runtime_data.device.stop()
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> None:
+    """Forget the link's outage clock and its repair along with the entry."""
+    address: str = entry.data[CONF_ADDRESS]
+    async_forget_link(hass, address)
+    ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id(address))

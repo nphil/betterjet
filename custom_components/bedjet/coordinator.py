@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 import logging
 from time import monotonic
 from typing import Protocol
@@ -11,7 +13,8 @@ from typing import Protocol
 from habluetooth import get_manager
 
 from homeassistant.components.bluetooth import async_scanner_by_source
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.event import async_call_later
@@ -61,6 +64,146 @@ def resolve_connection_source(
     return fallback_source if connected else None
 
 
+#: Key under ``hass.data[DOMAIN]`` for the per-address `LinkOutage` records.
+DATA_LINK_OUTAGES = "link_outages"
+
+
+@dataclass(slots=True)
+class LinkOutage:
+    """One BLE link's outage in progress, keyed by address in ``hass.data``.
+
+    Process-scoped on purpose - not on the coordinator, not on the entry's
+    ``runtime_data``. The first cut of this repair kept `_down_since` on the
+    coordinator, and a deliberate 21-minute outage on the live instance
+    (2026-09-09) never produced the repair: the household autoheal sweep
+    reloads any entry whose link is down every 5 minutes, and a reload
+    rebuilds the coordinator, so the countdown restarted from zero at 22:35
+    and again at 22:40 after a 22:24 drop. A 15-minute threshold measured by
+    anything the entry owns is unreachable by construction for exactly as
+    long as the device is down. Only the process outlives the reload.
+
+    `since` is `time.monotonic()`, like pybedjet's own timers: a wall-clock
+    jump must not fabricate a 15-minute outage.
+    """
+
+    since: float
+    #: Cancel for the pending deadline timer, or None while none is armed.
+    cancel: Callable[[], None] | None = None
+
+
+def _link_outages(hass: HomeAssistant) -> dict[str, LinkOutage]:
+    return hass.data.setdefault(DOMAIN, {}).setdefault(DATA_LINK_OUTAGES, {})
+
+
+def unreachable_issue_id(address: str) -> str:
+    """Repair-issue id for one device's link; one per config entry."""
+    return f"{address}{UNREACHABLE_ISSUE_SUFFIX}"
+
+
+def _entry_for_address(hass: HomeAssistant, address: str) -> ConfigEntry | None:
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        if entry.data.get(CONF_ADDRESS) == address:
+            return entry
+    return None
+
+
+@callback
+def async_reconcile_link(
+    hass: HomeAssistant, address: str, name: str, healthy: bool
+) -> None:
+    """Bring the `device_unreachable` repair for `address` in line with `healthy`.
+
+    The one place the outage clock is read or written. A healthy link forgets
+    the outage and deletes the issue. An unhealthy one starts the clock only
+    if none is running - never overwrites it, which is what a reload must not
+    be able to do - and then either raises the issue at once, when the link
+    has already been down for the whole grace period, or arms the deadline
+    for the time *remaining*, never a fresh full window. Arming is idempotent
+    so that setup retries and reloads inside the window cannot push the
+    deadline out.
+
+    Both registry calls are idempotent, so calling this from entry setup, from
+    the not-ready path, from every health edge and from the deadline is safe.
+    """
+    outages = _link_outages(hass)
+    issue_id = unreachable_issue_id(address)
+    if healthy:
+        if (outage := outages.pop(address, None)) is not None and outage.cancel:
+            outage.cancel()
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
+        return
+
+    now = monotonic()
+    if (outage := outages.get(address)) is None:
+        outage = outages[address] = LinkOutage(since=now)
+    remaining = UNREACHABLE_GRACE_S - (now - outage.since)
+    if remaining > 0:
+        # Nothing pushes a frame while the link is down, so the issue can
+        # only be raised by a timer; the countdown is what turns "down right
+        # now" into "down continuously for the whole grace period".
+        if outage.cancel is None:
+            outage.cancel = async_call_later(
+                hass, remaining, partial(_async_link_deadline, hass, address)
+            )
+        return
+    if outage.cancel is not None:
+        outage.cancel()
+        outage.cancel = None
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        issue_id,
+        is_fixable=True,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key="device_unreachable",
+        translation_placeholders={
+            "name": name,
+            "address": address,
+            "minutes": str(UNREACHABLE_GRACE_S // 60),
+        },
+    )
+
+
+@callback
+def async_forget_link(hass: HomeAssistant, address: str) -> None:
+    """Drop the outage record and any pending deadline for `address`.
+
+    For the entry being removed: the link is no longer anyone's to watch.
+    """
+    if (outage := _link_outages(hass).pop(address, None)) and outage.cancel:
+        outage.cancel()
+
+
+@callback
+def _async_link_deadline(hass: HomeAssistant, address: str, _now: datetime) -> None:
+    """The grace period elapsed: re-read the live link and reconcile from it.
+
+    Scheduled on `hass`, never on an entry unload callback: the timer has to
+    outlive the entry that armed it. Two callers need that. A reload tears
+    the coordinator down mid-countdown (the autoheal does so every 5 minutes
+    for as long as the link is down), and an entry stuck in `setup_retry`
+    because Home Assistant cannot find the device never had a coordinator or
+    an unload callback at all. So what is live is decided here, at the
+    moment of firing, not captured when the timer was armed.
+    """
+    if (outage := _link_outages(hass).get(address)) is None:
+        return
+    outage.cancel = None
+    entry = _entry_for_address(hass, address)
+    if entry is None:
+        return
+    if entry.state is ConfigEntryState.LOADED:
+        entry.runtime_data.async_reconcile_unreachable_issue()
+    elif entry.state is ConfigEntryState.SETUP_RETRY:
+        # Still failing setup, which for this integration means Home
+        # Assistant still cannot find the device - the most total outage
+        # there is, and the one a coordinator-owned countdown never covered.
+        async_reconcile_link(hass, address, entry.title, healthy=False)
+    # Anything else (unloading, mid-reload, disabled): nobody is watching the
+    # link right now. The clock survives, and whichever setup comes next
+    # reconciles from it - raising immediately if the outage is old enough.
+
+
 class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
     """Coordinate a single BedJet device.
 
@@ -98,14 +241,10 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
         # tracks the GATT link edge for the operator-facing INFO log;
         # `_link_was_up` tracks *health* (connected and streaming) for the
         # repair issue, which must not clear on a link that reconnected but
-        # went silent again.
+        # went silent again. The outage clock itself lives in `hass.data`,
+        # not here - see `LinkOutage` for the measurement that forced that.
         self._was_connected = device.connected
         self._link_was_up = device.available
-        #: `time.monotonic()` at which the link was first seen down, or None
-        #: while it is up. Monotonic, like pybedjet's own timers: a wall
-        #: clock jump must not fabricate a 15-minute outage.
-        self._down_since: float | None = None
-        self._cancel_unreachable: Callable[[], None] | None = None
 
     @property
     def available(self) -> bool:
@@ -161,11 +300,6 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
         scanner = async_scanner_by_source(self.hass, source)
         return scanner.adapter if scanner is not None else source
 
-    @property
-    def unreachable_issue_id(self) -> str:
-        """Repair-issue id for this device's link; one per config entry."""
-        return f"{self.device.address}{UNREACHABLE_ISSUE_SUFFIX}"
-
     @callback
     def async_reconcile_unreachable_issue(self) -> None:
         """Bring the `device_unreachable` repair in line with the live link.
@@ -197,60 +331,12 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
         repair. The allocation-without-frames case is the ghost link, which
         this predicate already reports as down.
         """
-        if self.available:
-            self._down_since = None
-            self._async_cancel_unreachable_countdown()
-            ir.async_delete_issue(self.hass, DOMAIN, self.unreachable_issue_id)
-            return
-
-        now = monotonic()
-        if self._down_since is None:
-            self._down_since = now
-        elapsed = now - self._down_since
-        if elapsed < UNREACHABLE_GRACE_S:
-            self._async_arm_unreachable_countdown(UNREACHABLE_GRACE_S - elapsed)
-            return
-        self._async_cancel_unreachable_countdown()
-        ir.async_create_issue(
+        async_reconcile_link(
             self.hass,
-            DOMAIN,
-            self.unreachable_issue_id,
-            is_fixable=True,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="device_unreachable",
-            translation_placeholders={
-                "name": self.name or self.device.address,
-                "address": self.device.address,
-                "minutes": str(UNREACHABLE_GRACE_S // 60),
-            },
+            self.device.address,
+            self.name or self.device.address,
+            self.available,
         )
-
-    @callback
-    def _async_arm_unreachable_countdown(self, delay: float) -> None:
-        """Schedule the deadline check, unless one is already pending.
-
-        Nothing pushes a frame while the link is down, so the issue can only
-        be raised by a timer; the countdown is what turns "down right now"
-        into "down continuously for the whole grace period".
-        """
-        if self._cancel_unreachable is not None:
-            return
-        self._cancel_unreachable = async_call_later(
-            self.hass, delay, self._async_unreachable_deadline
-        )
-
-    @callback
-    def _async_cancel_unreachable_countdown(self) -> None:
-        """Drop any pending deadline check."""
-        if self._cancel_unreachable is not None:
-            self._cancel_unreachable()
-            self._cancel_unreachable = None
-
-    @callback
-    def _async_unreachable_deadline(self, _now: datetime) -> None:
-        """The grace period elapsed: reconcile, which now raises the issue."""
-        self._cancel_unreachable = None
-        self.async_reconcile_unreachable_issue()
 
     @callback
     def _handle_device_update(self, device: BedJet) -> None:
@@ -336,11 +422,10 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
     async def async_shutdown(self) -> None:
         """Stop listening to the device in addition to the base shutdown.
 
-        Home Assistant registers this as a config-entry unload callback, so
-        the pending unreachable countdown is dropped here rather than needing
-        its own registration - a timer firing after unload would create an
-        issue nobody can fix.
+        The unreachable countdown is deliberately *not* cancelled here: it is
+        process-scoped (see `LinkOutage`) precisely so that a reload cannot
+        restart it, and its deadline re-reads the entry's live state before
+        raising anything, so an unloaded entry gets no issue from it.
         """
-        self._async_cancel_unreachable_countdown()
         self._unregister_device_callback()
         await super().async_shutdown()
