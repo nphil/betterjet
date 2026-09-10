@@ -86,8 +86,23 @@ class FakeConfigEntries:
         return True
 
 
+class _FakeServices:
+    """Just enough registry for the release_link registration at setup."""
+
+    def __init__(self) -> None:
+        self.registered: set[str] = set()
+
+    def has_service(self, domain, service) -> bool:
+        return f"{domain}.{service}" in self.registered
+
+    def async_register(self, domain, service, handler, schema=None) -> None:
+        self.registered.add(f"{domain}.{service}")
+
+
 class FakeHass:
     def __init__(self) -> None:
+        # Entry setup registers the domain release_link action.
+        self.services = _FakeServices()
         self.bus = FakeBus()
         self.config_entries = FakeConfigEntries()
         # The `device_unreachable` outage clock lives here, keyed by address.

@@ -104,6 +104,14 @@ def install() -> bool:
 
     core.callback = callback
     core.HomeAssistant = HomeAssistant
+
+    class ServiceCall:
+        """Only what the release_link handler reads: `data`."""
+
+        def __init__(self, data=None):
+            self.data = data or {}
+
+    core.ServiceCall = ServiceCall
     core.Event = Event
     core.CoreState = CoreState
 

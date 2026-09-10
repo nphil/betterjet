@@ -190,6 +190,10 @@ class FakeServices:
     async def async_call(self, domain, service, data=None, blocking=False) -> None:
         self.calls.append((str(domain), str(service), data))
 
+    def async_register(self, domain, service, handler, schema=None):
+        """Entry setup registers the domain's release_link action."""
+        self._registered.add(f"{domain}.{service}")
+
 
 class FakeConfigEntries:
     def __init__(self) -> None:
