@@ -25,6 +25,7 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant import data_entry_flow
+from homeassistant.components import bluetooth
 from homeassistant.components.repairs import RepairsFlow
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
@@ -55,6 +56,18 @@ ESPHOME_DOMAIN = "esphome"
 #: "master-bedroom-bluetooth-proxy" answers to
 #: `esphome.master_bedroom_bluetooth_proxy_restart_proxy`.
 RESTART_PROXY_ACTION_SUFFIX = "_restart_proxy"
+
+#: Entry states this ladder can act on. SETUP_RETRY belongs here as much as
+#: LOADED: a BedJet that is silent when Home Assistant starts fails setup with
+#: ConfigEntryNotReady and keeps retrying, which is exactly when someone
+#: reaches for this Fix button - and both `reload` and `power_cycle` work on an
+#: entry that never loaded. Measured 2026-09-09 on the live instance: an
+#: AC Infinity sibling sat in setup_retry ("Could not find ... device with
+#: address") while its radio was silent to all seven proxies, so the mains rung
+#: was the only one that could have helped and an abort here withheld it.
+#: Anything else - disabled, a setup error, a failed unload - needs a decision
+#: from the operator that no amount of restarting can supply.
+ACTIONABLE_STATES = (ConfigEntryState.LOADED, ConfigEntryState.SETUP_RETRY)
 
 #: How long each rung waits for the link to come back before admitting it did
 #: not work. A reachable BedJet answers within a second or two of a connect
@@ -104,11 +117,34 @@ class BleRecoveryFixFlow(RepairsFlow):
         `coordinator.available`, not `device.connected`: a connected-but-silent
         link is precisely the failure being repaired here, so treating it as
         success would have every rung of the ladder report a false victory.
+
+        With no coordinator there is nothing to ask, and reporting False
+        forever would make every rung fail for an entry in SETUP_RETRY - the
+        state this ladder was extended to serve. The honest substitute is the
+        same signal setup itself blocks on: a connectable advertisement. If the
+        BedJet is heard again, setup's own retry (or the `reload` rung) will
+        load the entry, and the next poll sees the coordinator.
         """
         entry = self._entry()
-        if entry is None or entry.state is not ConfigEntryState.LOADED:
+        if entry is None:
             return False
-        return entry.runtime_data.available
+        if entry.state is ConfigEntryState.LOADED:
+            return entry.runtime_data.available
+        return self._is_advertising()
+
+    def _is_advertising(self) -> bool:
+        """True when Home Assistant has a connectable advertisement for us.
+
+        Deliberately the identical call `async_setup_entry` fails on, so this
+        cannot disagree with the condition that raised the repair.
+        """
+        last_seen = getattr(bluetooth, "async_last_service_info", None)
+        if last_seen is None:  # pragma: no cover - very old Home Assistant
+            return False
+        try:
+            return last_seen(self.hass, self.address, connectable=True) is not None
+        except Exception:  # noqa: BLE001 - no manager before bluetooth is set up
+            return False
 
     def _link_state(self) -> str:
         """One line describing the link, for the menu text."""
@@ -116,7 +152,9 @@ class BleRecoveryFixFlow(RepairsFlow):
         if entry is None:
             return "its configuration entry is gone"
         if entry.state is not ConfigEntryState.LOADED:
-            return "the integration is not loaded"
+            if self._is_advertising():
+                return "advertising again, but the integration has not loaded yet"
+            return "not loaded, and not advertising to any proxy"
         coordinator = entry.runtime_data
         if not coordinator.available:
             return "no Bluetooth link"
@@ -163,7 +201,7 @@ class BleRecoveryFixFlow(RepairsFlow):
         entry = self._entry()
         if entry is None:
             return self.async_abort(reason="entry_not_found")
-        if entry.state is not ConfigEntryState.LOADED:
+        if entry.state not in ACTIONABLE_STATES:
             return self.async_abort(reason="not_loaded")
         return await self.async_step_menu()
 

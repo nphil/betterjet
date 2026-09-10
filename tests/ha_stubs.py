@@ -269,6 +269,11 @@ def install() -> bool:
         return None
 
     def async_last_service_info(hass, address, connectable=True):
+        # Tests that care whether the device is being heard again set
+        # `hass.bluetooth_seen`; everything else keeps the silent default,
+        # which is what setup blocks on.
+        if getattr(hass, "bluetooth_seen", False):
+            return object()
         return None
 
     def async_register_callback(hass, callback_fn, matcher, mode):

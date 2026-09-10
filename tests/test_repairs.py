@@ -807,9 +807,28 @@ class TestWizardSteps:
 
         assert result == {"type": "abort", "reason": "entry_not_found"}
 
-    def test_flow_aborts_when_the_integration_is_not_loaded(
+    def test_flow_aborts_when_the_entry_cannot_be_acted_on(
         self, registry, timers, clock
     ) -> None:
+        # SETUP_ERROR is a decision for the operator - a bad address, a
+        # migration failure - and no rung of this ladder can help. SETUP_RETRY
+        # deliberately does NOT abort; see the test below.
+        hass = FakeHass()
+        entry = FakeEntry()
+        entry.state = ConfigEntryState.SETUP_ERROR
+        hass.config_entries.entries.append(entry)
+
+        result = asyncio.run(make_flow(hass).async_step_init())
+
+        assert result == {"type": "abort", "reason": "not_loaded"}
+
+    def test_a_retrying_entry_still_gets_the_ladder(
+        self, registry, timers, clock
+    ) -> None:
+        # The case this exists for: the device was silent when Home Assistant
+        # started, so setup raised ConfigEntryNotReady and the entry is
+        # retrying. That is when the operator reaches for Fix, and the mains
+        # rung is the only one that can help a radio nothing can hear.
         hass = FakeHass()
         entry = FakeEntry()
         entry.state = ConfigEntryState.SETUP_RETRY
@@ -817,4 +836,23 @@ class TestWizardSteps:
 
         result = asyncio.run(make_flow(hass).async_step_init())
 
-        assert result == {"type": "abort", "reason": "not_loaded"}
+        assert result["type"] == "menu"
+        assert "power_cycle" in result["menu_options"]
+        assert "reload" in result["menu_options"]
+
+    def test_a_retrying_entry_reports_a_device_that_is_heard_again(
+        self, registry, timers, clock
+    ) -> None:
+        # Without a coordinator the ladder judges health by the same
+        # connectable advertisement setup blocks on, so a device that came
+        # back is reported as progress rather than as "no link" forever.
+        hass = FakeHass()
+        entry = FakeEntry()
+        entry.state = ConfigEntryState.SETUP_RETRY
+        hass.config_entries.entries.append(entry)
+        hass.bluetooth_seen = True
+
+        result = asyncio.run(make_flow(hass).async_step_init())
+
+        assert result["type"] == "menu"
+        assert "advertising again" in result["description_placeholders"]["link_state"]
