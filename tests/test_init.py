@@ -40,6 +40,10 @@ class FakeBedJet:
         self.state = SimpleNamespace(sentinel=True)
         self.address = ADDRESS
         self.connected = False
+        # Setup reconciles the `device_unreachable` repair against the live
+        # link, so the fake has to answer the same freshness question the
+        # real device does.
+        self.available = False
         self.scanner_source = source
         FakeBedJet.instances.append(self)
 

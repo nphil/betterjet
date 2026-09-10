@@ -91,6 +91,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
     # wait for a connection to actually succeed.
     await device.start()
 
+    # The one reconciliation that runs after a config entry reload, and so the
+    # one that stops a `device_unreachable` repair from outliving the outage it
+    # describes: reloading builds a brand-new coordinator, whose in-memory view
+    # of "was an issue open?" is empty by construction. It also starts the
+    # 15-minute countdown when the link is already down at setup.
+    coordinator.async_reconcile_unreachable_issue()
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _async_stop(event: Event) -> None:

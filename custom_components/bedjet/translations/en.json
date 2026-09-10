@@ -95,5 +95,38 @@
         "name": "Mute beeps"
       }
     }
+  },
+  "issues": {
+    "device_unreachable": {
+      "title": "{name} ({address}) has had no Bluetooth link for at least {minutes} minutes",
+      "fix_flow": {
+        "abort": {
+          "entry_not_found": "This BedJet is no longer configured, so there is nothing left to recover.",
+          "not_loaded": "The BedJet integration is not loaded, so it can neither report on the link nor recover it. Fix the configuration entry first under Settings > Devices & services, then run this repair again."
+        },
+        "step": {
+          "menu": {
+            "title": "Recover the Bluetooth link",
+            "description": "{name} is currently: {link_state}.\n\nThe BedJet accepts one Bluetooth connection at a time and streams its status about four times a second for as long as a real link is held, so a device this quiet is not merely idle: either nothing is connected to it, or a proxy is still holding its single connection slot with a link that no longer carries anything. Because the slot looks occupied, the BedJet stops advertising and nothing else can get in.\n\nWork down the list - each step is more disruptive than the one above it, and each one re-checks the link before bringing you back here.\n\n{last_result}",
+            "menu_options": {
+              "recheck": "Check the link again (does nothing else)",
+              "reload": "Reload the integration (reconnects; nothing else is affected)",
+              "restart_proxy": "Restart the Bluetooth proxy that last held the link",
+              "power_cycle": "Cut and restore mains power to the BedJet (last resort)"
+            }
+          },
+          "power_cycle": {
+            "title": "Power-cycle {name}",
+            "description": "This switches an outlet off, waits ten seconds, and switches it back on. It cuts mains power to {name}: any running program stops, and the BedJet needs a moment to boot and start advertising again before anything can connect. Only do this once reloading and restarting the proxy have both failed.\n\nPick the switch that actually feeds this BedJet. The choice is remembered, so you will not be asked again.",
+            "data": {
+              "entity_id": "Outlet switch"
+            },
+            "data_description": {
+              "entity_id": "The switch that controls mains power to this BedJet."
+            }
+          }
+        }
+      }
+    }
   }
 }

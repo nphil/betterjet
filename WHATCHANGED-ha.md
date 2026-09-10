@@ -1,7 +1,8 @@
 # WHATCHANGED - HA layer (HALayer)
 
 Scope: `custom_components/bedjet/` top-level platform files, `coordinator.py` (new),
-`diagnostics.py` (new), `const.py`, `strings.json`/`translations/en.json`/`icons.json`,
+`diagnostics.py` (new), `repairs.py` (new), `const.py`,
+`strings.json`/`translations/en.json`/`icons.json`,
 `manifest.json`, repo-root `hacs.json`, `README.md`, `.github/workflows/{validate,release,stale}.yaml`.
 Does not touch `custom_components/bedjet/pybedjet/` (LibLayer) or `tests/` (TestsCI-2).
 
@@ -238,3 +239,148 @@ in a table, gives a debug-logger snippet, and preserves the credit lineage
 (robert-friedland -> asheliahut -> natekspencer -> nphil). Dropped the
 auto-generated release/download/star-history badges tied to natekspencer's
 GitHub stats, since this fork's releases/stars are tracked separately.
+
+## `device_unreachable` repair + escalating recovery wizard
+
+Added for the case the household's own healing machinery (a heal script plus an
+hourly re-home) cannot fix: a link that stays down. `repairs.py` is new,
+`coordinator.py` grew the issue lifecycle, `__init__.py` gained one call, and
+`const.py` holds the four new constants (`UNREACHABLE_GRACE_S`,
+`UNREACHABLE_ISSUE_SUFFIX`, `OPTION_LAST_HOLDING_PROXY`,
+`OPTION_RECOVERY_OUTLET`). `manifest.json` needs nothing: `repairs` is not a
+declared dependency, Home Assistant discovers the platform by module name.
+
+### The bug this is shaped around
+
+A sibling BLE integration in this house raised a repair at 12:22, the condition
+cleared at 13:00, and the issue was still open 13 hours later. Its
+`async_delete_issue` was gated on an in-memory "previously synced" flag that a
+config-entry reload reset to `None`, and the reload landed at 12:38 - between
+the two. So the rule here is that issue state is only ever reconciled against
+*reality*: `async_reconcile_unreachable_issue()` reads the live link, never a
+remembered "did we open one?". Both registry calls are idempotent, so it is
+called from every health edge *and* unconditionally from `async_setup_entry` -
+and that setup-time call is the one that survives a reload, because a fresh
+coordinator's memory is empty by construction.
+
+### What "unreachable" means here
+
+`device.available` (connected AND a frame inside the library's staleness
+window), not `device.connected`. The BedJet streams status at ~4 Hz for as long
+as a real link is held, so a connection that stopped producing frames is a
+wedged link that still occupies the device's only connection slot - which is
+precisely the failure the repair exists to surface. `device.connected` alone,
+or "the entities still show values", would suppress it.
+
+Conjoining habluetooth's slot accounting (`connection_source is not None`) was
+considered and rejected, and the reasoning is in the reconcile's docstring so
+it does not get re-litigated: a frame can only arrive over a live GATT link, so
+freshness already implies the link, and `resolve_connection_source` falls back
+to the last scanner source whenever we are connected - the conjunction
+discriminates in no reachable state, while putting a `get_manager()` call
+(which raises before the Bluetooth manager exists) in the path that *clears*
+the repair. Allocation-without-frames is the ghost link, which `available`
+already reports as down.
+
+The issue is raised only after the link has been down continuously for
+`UNREACHABLE_GRACE_S` (15 minutes), timed with `async_call_later` against
+`time.monotonic()` (a wall-clock jump must not fabricate an outage) and
+cancelled from `async_shutdown`, which Home Assistant registers as a
+config-entry unload callback. Nothing pushes a frame while the link is down, so
+a timer is the only thing that can turn "down now" into "down for 15 minutes".
+
+Two edge flags now exist and mean different things: `_was_connected` drives the
+operator-facing connect/disconnect INFO log (GATT edge), `_link_was_up` drives
+the repair (health edge). The health edge is gated purely to keep the issue
+registry from being rewritten four times a second - `async_get_or_create` fires
+a registry-updated event and schedules a save even when the issue already
+exists - and cannot strand an issue, because setup reconciles unconditionally.
+
+### Remembering the proxy
+
+While the repair is open, nothing holds the device, so there is no live scanner
+to name - yet naming one is exactly what a "restart the proxy" step needs. The
+connect edge writes the proxy's node name into
+`entry.options["last_holding_proxy"]`, and only when it changed. The connect
+edge is sufficient: a GATT link belongs to the radio that opened it, so it
+cannot migrate between proxies without a disconnect first.
+
+**Which name, exactly** - this was nearly a silent production failure. The
+first cut persisted `connection_scanner_name`, i.e. what the Connection sensor
+shows. habluetooth builds a remote scanner's `name` as "<adapter> (<source>)"
+(`base_scanner.py`: `self.name = adapter_human_name(adapter, source) if adapter
+!= source else source`), and the live instance confirmed it on 2026-09-09:
+`sensor.master_bedroom_bedjet_connection` read `downstairs-bluetooth-proxy
+(D4:D4:DA:9D:40:8A)` while the registered action was
+`esphome.downstairs_bluetooth_proxy_restart_proxy`. Slugifying the display name
+would have looked up
+`esphome.downstairs_bluetooth_proxy_d4_d4_da_9d_40_8a_restart_proxy`, found
+nothing, and dropped the proxy rung from the menu forever - with no error
+anywhere. The new `holding_proxy_name` property reads `scanner.adapter`, the
+bare ESPHome node name, which is also immune to the device being renamed in
+Home Assistant (the downstairs proxy is named for the Tool Room area in HA
+while its node is still `downstairs`). `connection_scanner_name` and the
+Connection sensor are deliberately unchanged; automations read that sensor.
+
+Two option-write hazards flagged during this batch do not apply to this
+integration, and were checked rather than assumed: there is no
+`add_update_listener` registration anywhere (so an options write cannot trigger
+a reload, let alone a reload loop while a link flaps), and there is no options
+flow at all (so no `async_create_entry(data=user_input)` can wipe
+`last_holding_proxy`/`recovery_outlet`). Both of this integration's own writes
+merge with `{**entry.options, ...}`; if an options flow is ever added, it must
+do the same.
+
+### The wizard
+
+`BleRecoveryFixFlow` (`async_step_init` -> `async_step_menu`) offers, in order:
+`recheck`, `reload`, `restart_proxy`, `power_cycle` - cheapest first, the
+mains-cutting rung last. This ordering is deliberately identical across the
+four BLE integrations that got this pattern, so the operator sees one ladder
+everywhere.
+
+`restart_proxy` is only in the menu when a proxy is known (the live hold, else
+the remembered node name) *and* `slugify(<node>) + "_restart_proxy"` is a
+registered `esphome` action. ESPHome exposes API actions (`api:` -> `actions:`,
+not a Restart *button* entity - the proxies' config buttons are registry-
+disabled here) as `esphome.<node slug>_<action>`, so
+`downstairs-bluetooth-proxy` answers to
+`esphome.downstairs_bluetooth_proxy_restart_proxy`. Offering a rung that cannot
+be climbed is worse than not offering it. The lookup uses
+`hass.services.has_service(...)`, not `async_services()`: core's own docstring
+says the latter copies the whole service registry and is expensive, and the
+menu re-derives this on every draw.
+
+Every rung then polls the health predicate in `POLL_INTERVAL_S` slices against
+a `monotonic()` deadline (so the check's own cost comes out of the budget
+rather than silently extending it) for up to 45 s (60 s after a power cycle,
+which also has to wait out a boot), with `asyncio.sleep` rather than a blocking
+wait: the link returns through pybedjet's
+own supervisor, so there is nothing here to await, and a repair flow must never
+sit on the event loop. Healthy -> `async_create_entry(data={})` *and* a call
+into the coordinator's own reconcile, so both views of the issue agree
+immediately instead of drifting until the next health edge. Still unhealthy ->
+back to the menu with a `last_result` placeholder saying what was tried and how
+it went (empty string on first entry, never the literal "None").
+
+`restart_proxy` reports "asked to restart", never "rebooted": the proxy firmware
+refuses to restart within 20 minutes of booting (it logs `refused: up only N s`
+and carries on), so that rung can legitimately do nothing at all.
+
+`power_cycle` shows an `EntitySelector(domain="switch")` prefilled from
+`entry.options["recovery_outlet"]`, stores the choice back there on submit, then
+`switch.turn_off` -> 10 s -> `switch.turn_on`. There is no smart plug wired to
+this BedJet today, so the step has to work with whatever outlet the operator
+picks, and it is described in `strings.json` as cutting mains power and as the
+last resort. Flow aborts with a translated reason when the config entry is gone
+(`entry_not_found`) or not loaded (`not_loaded`); the entry is re-resolved on
+every use, since the first rung of the ladder replaces `runtime_data` wholesale.
+
+### strings.json / translations/en.json
+
+New `issues.device_unreachable` block: title, `fix_flow.step.menu`
+(description + `menu_options` labels), `fix_flow.step.power_cycle`
+(description + `data`/`data_description`), and both `fix_flow.abort` reasons.
+The prose says what each rung does, that reload is the cheap one, that a proxy
+restart may be refused if the proxy booted recently, and that the power cycle
+cuts mains power. Both files stay byte-identical, as before.

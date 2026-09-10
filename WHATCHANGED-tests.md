@@ -5,7 +5,7 @@ Does not touch any source file under `custom_components/bedjet/`.
 
 Run: `uv run --python 3.13 --with-requirements requirements_test.txt python -m pytest tests -q`
 (plain `pip install -r requirements_test.txt && pytest tests -q` on CPython 3.13 works identically).
-190 tests, 0 skipped, ~0.3s wall time, no BLE hardware, no Home Assistant checkout, no real
+248 tests, 0 skipped, ~0.7s wall time, no BLE hardware, no Home Assistant checkout, no real
 time.sleep beyond a handful of sub-20ms real awaits used to let a genuinely-pending asyncio
 timer/task fire (never the 60s/300s/900s/2s..120s real production durations - every one of
 those constants is monkeypatched or driven through a fake monotonic clock).
@@ -17,8 +17,9 @@ those constants is monkeypatched or driven through a fake monotonic clock).
   `ac_infinity` rebuild's `tests/ha_stubs.py`). Covers every HA symbol every bedjet source
   file imports at module level: core/const/exceptions/config_entries/data_entry_flow,
   `components.bluetooth` (+ `.match`), `components.{climate,fan,sensor,binary_sensor,switch,
-  number,button}`, `helpers.{device_registry,entity_platform,update_coordinator}`,
-  `util.dt`. `DataUpdateCoordinator`/`CoordinatorEntity` are faithful enough that
+  number,button,repairs}`,
+  `helpers.{device_registry,entity_platform,issue_registry,event,selector,update_coordinator}`,
+  `util.{dt,slugify}`. `DataUpdateCoordinator`/`CoordinatorEntity` are faithful enough that
   `coordinator.async_set_updated_data(...)`/`async_update_listeners()` genuinely fan out to
   every registered entity's `_handle_coordinator_update`, so push-driven-update tests exercise
   real wiring, not a mock that always "works". `*EntityDescription` stubs are real
@@ -109,6 +110,55 @@ regression test and the corrected `is not None` check are covered; `scanner` sen
 sensor that updates before any frame has ever decoded (`coordinator.data is None` bypass);
 diagnostic-vs-enabled-by-default and config-vs-diagnostic entity_category/enabled flags are
 asserted per entity across every platform that HALayer's map specifies.
+
+**Repairs (`test_repairs.py`)** - the `device_unreachable` issue and its recovery wizard.
+
+The load-bearing test is `test_a_reload_mid_outage_does_not_strand_the_issue`, and it pins the
+sequence production actually produces: `async_setup_entry` always builds a fresh `BedJet` whose
+`start()` only spawns the connect loop, so the device is never streaming at the setup-time
+reconcile. The test therefore seeds an open issue, runs setup with the device down (issue must
+survive - the outage is still on), then pushes the first frame (issue must go). An earlier
+version of this test set `available=True` before setup and was green against a branch that
+cannot occur in production; caught in review and replaced.
+`test_reconcile_deletes_an_issue_it_never_saw_created` pins the same rule at the unit level in
+the state a post-reload coordinator is really in. Mutation-verified: re-introducing the
+original bug shape (`if self.available and self._down_since is not None`) fails both, removing
+the setup-time reconcile call fails `test_setup_keeps_an_issue_the_link_still_justifies`, and
+persisting habluetooth's display name instead of the node name fails the two proxy tests.
+
+The rest: an ongoing outage keeps its issue and re-arms the countdown; the issue appears only
+once the full 15-minute grace period has elapsed (fired one second short first, and it must not
+appear); reconnecting deletes it and cancels the countdown; a connected-but-silent link still
+counts as unreachable; unload drops the pending timer; a connect edge records the holding proxy
+into `entry.options` and a reconnect to the *same* proxy does not rewrite it; a remembered proxy
+still resolves the action its ESPHome node registers; `restart_proxy` is in the menu only when a
+proxy is known and a matching `esphome` action is registered (all three combinations); the
+menu's `last_result` is `""` before anything is tried; a rung that did not help returns to the
+menu with a non-empty `last_result`; a recovered link ends the flow with `create_entry` and an
+empty issue registry; `power_cycle` stores the chosen switch, calls `switch.turn_off`/`turn_on`,
+and prefills the field from the stored option next time; the flow aborts when the entry is
+missing or not loaded.
+
+The scanner fake uses the live shapes rather than convenient ones: `name` is
+`"downstairs-bluetooth-proxy (D4:D4:DA:9D:40:8A)"` and `adapter` is
+`"downstairs-bluetooth-proxy"`, exactly as habluetooth builds them and exactly what
+`sensor.master_bedroom_bedjet_connection` was observed reporting, against the real registered
+action `esphome.downstairs_bluetooth_proxy_restart_proxy`. With a tidied-up fake the proxy tests
+would have passed while the feature was dead on the actual hardware.
+
+The `holding_proxy` fixture returns its allocation list so a test can empty it, which is not
+decoration: `resolve_connection_source` answers from habluetooth's allocations *before* it ever
+consults `connected`, so a test that only flips the fake device's flags still reports a live
+hold and never reaches the remembered-proxy branch it claims to exercise. The end-to-end proxy
+test now clears the allocation (the proxy giving the slot back), asserts
+`coordinator.holding_proxy_name is None` so a live hold cannot be answering, and only then
+checks the menu still offers the restart from `entry.options`.
+
+Every assertion is issue-registry contents, flow result type/step, `menu_options`, or stored
+entry options - never the translated wording (which would break on a copy edit) and never the
+order or count of the integration's idempotent registry calls. The 15-minute grace period runs
+on a fake monotonic clock plus a fake `async_call_later` the test fires by hand, and the
+wizard's 45/60-second poll windows are patched to `0.0`, so nothing waits.
 
 ## Design decisions
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.util
+import re
 import sys
 from collections.abc import Callable
 from enum import Enum, IntFlag, StrEnum
@@ -113,6 +114,10 @@ def install() -> bool:
     const.CONF_SERVICE_DATA = "service_data"
     const.ATTR_TEMPERATURE = "temperature"
     const.EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"
+    const.ATTR_ENTITY_ID = "entity_id"
+    const.CONF_ENTITY_ID = "entity_id"
+    const.SERVICE_TURN_OFF = "turn_off"
+    const.SERVICE_TURN_ON = "turn_on"
 
     class UnitOfTemperature(StrEnum):
         CELSIUS = "°C"
@@ -206,7 +211,16 @@ def install() -> bool:
         def async_create_entry(self, *, title: str, data):
             return {"type": "create_entry", "title": title, "data": data}
 
+    class ConfigEntryState(Enum):
+        """Only the states the repair flow distinguishes between."""
+
+        LOADED = "loaded"
+        NOT_LOADED = "not_loaded"
+        SETUP_ERROR = "setup_error"
+        SETUP_RETRY = "setup_retry"
+
     config_entries.ConfigEntry = ConfigEntry
+    config_entries.ConfigEntryState = ConfigEntryState
     config_entries.ConfigFlowResult = dict
     config_entries.ConfigFlow = ConfigFlow
 
@@ -545,6 +559,44 @@ def install() -> bool:
     button.ButtonEntityDescription = ButtonEntityDescription
     button.ButtonEntity = ButtonEntity
 
+    # -- homeassistant.components.repairs ------------------------------------
+    # Real ``RepairsFlow`` is a ``data_entry_flow.FlowHandler``; the flow
+    # result shapes below are the only part of it the repair wizard's tests
+    # observe (and they match real HA, whose FlowResultType members are a
+    # StrEnum comparing equal to these literals).
+    repairs = _module("homeassistant.components.repairs")
+    components.repairs = repairs
+
+    class RepairsFlow:
+        """Behavioral subset of HA's RepairsFlow used by the repair wizard."""
+
+        hass = None
+
+        def async_abort(self, *, reason: str):
+            return {"type": "abort", "reason": reason}
+
+        def async_show_menu(self, *, step_id: str, menu_options, description_placeholders=None):
+            return {
+                "type": "menu",
+                "step_id": step_id,
+                "menu_options": menu_options,
+                "description_placeholders": description_placeholders,
+            }
+
+        def async_show_form(self, *, step_id: str, data_schema=None, errors=None, description_placeholders=None):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors,
+                "description_placeholders": description_placeholders,
+            }
+
+        def async_create_entry(self, *, title=None, data=None):
+            return {"type": "create_entry", "title": title, "data": data}
+
+    repairs.RepairsFlow = RepairsFlow
+
     # -- homeassistant.helpers ------------------------------------------------
     helpers = _module("homeassistant.helpers")
 
@@ -573,6 +625,60 @@ def install() -> bool:
 
     entity_platform.AddEntitiesCallback = AddEntitiesCallback
     entity_platform.AddConfigEntryEntitiesCallback = AddConfigEntryEntitiesCallback
+
+    # The repair-issue registry and the timer helper are real Home Assistant
+    # state (storage writes, a bus event, a loop timer). Tests that care about
+    # either one monkeypatch these on the module under test and assert on what
+    # their own recorder saw - which is also how they keep working under real
+    # Home Assistant - so the stubs only have to exist and stay out of the way
+    # of the many tests that do not care.
+    issue_registry = _module("homeassistant.helpers.issue_registry")
+    helpers.issue_registry = issue_registry
+
+    class IssueSeverity(StrEnum):
+        CRITICAL = "critical"
+        ERROR = "error"
+        WARNING = "warning"
+
+    def async_create_issue(hass, domain, issue_id, **kwargs) -> None:
+        """No-op; see the note above."""
+
+    def async_delete_issue(hass, domain, issue_id) -> None:
+        """No-op; see the note above."""
+
+    issue_registry.IssueSeverity = IssueSeverity
+    issue_registry.async_create_issue = async_create_issue
+    issue_registry.async_delete_issue = async_delete_issue
+
+    event = _module("homeassistant.helpers.event")
+    helpers.event = event
+
+    def async_call_later(hass, delay, action):
+        """No-op timer returning an unsub, like the real helper."""
+        return lambda: None
+
+    event.async_call_later = async_call_later
+
+    selector = _module("homeassistant.helpers.selector")
+    helpers.selector = selector
+
+    class EntitySelectorConfig(dict):
+        """Real type is a TypedDict; a plain dict is a faithful stand-in."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    class EntitySelector:
+        """Selectors are voluptuous validators, so this stays callable."""
+
+        def __init__(self, config=None) -> None:
+            self.config = config or {}
+
+        def __call__(self, data):
+            return data
+
+    selector.EntitySelectorConfig = EntitySelectorConfig
+    selector.EntitySelector = EntitySelector
 
     update_coordinator = _module("homeassistant.helpers.update_coordinator")
     helpers.update_coordinator = update_coordinator
@@ -683,7 +789,7 @@ def install() -> bool:
 
     update_coordinator.CoordinatorEntity = CoordinatorEntity
 
-    # -- homeassistant.util(.dt / .percentage) --------------------------------
+    # -- homeassistant.util(.dt / .slugify) -----------------------------------
     util = _module("homeassistant.util")
     ha.util = util
 
@@ -697,6 +803,20 @@ def install() -> bool:
 
     dt_util.now = dt_now
     dt_util.UTC = _datetime.UTC
+
+    def slugify(text, *, separator: str = "_") -> str:
+        """Faithful for the inputs that matter here: scanner names.
+
+        Real HA delegates to python-slugify; what the repair wizard depends on
+        is that "master-bedroom-bluetooth-proxy" becomes
+        "master_bedroom_bluetooth_proxy", i.e. exactly the ESPHome device slug.
+        """
+        if not text:
+            return ""
+        slug = re.sub(r"[^a-z0-9]+", separator, str(text).lower()).strip(separator)
+        return slug or "unknown"
+
+    util.slugify = slugify
 
     ha.core = core
     ha.const = const

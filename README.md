@@ -34,6 +34,19 @@ If your BedJet is only reachable through an ESPHome Bluetooth proxy, remember th
 - Setting a temperature while the unit is off is **deferred, not sent**: a BedJet in standby silently ignores a setpoint write, so the command used to sit for the full 5 second confirmation window and then fail (which is exactly what the Apple Home app does every time it writes a target temperature). The requested value is shown right away and written the moment you turn the unit on from this entity; if something else starts the unit first, the device's own target wins and the deferred value is dropped.
 - The `connection` sensor names the Bluetooth adapter or proxy currently carrying the held GATT link (or `disconnected`), pushed from Home Assistant's live connection-slot allocations. Its attributes add `hold`, `drops_1h`, `last_drop` and `reconnect_attempt`, so a "restart the proxy" automation can tell which proxy to restart - and can leave alone a proxy other devices are using.
 
+## When the link does not come back
+
+Reconnecting is automatic and usually invisible. When it is not - the link has been down for **15 minutes** with nothing streaming - the integration raises a repair under **Settings → System → Repairs**, and the repair's **Fix** button opens an escalating wizard:
+
+1. **Check the link again.** Costs nothing, and a link that came back on its own only needs someone to look.
+2. **Reload the integration.** Rebuilds the client and reconnects. Nothing outside this BedJet is affected.
+3. **Restart the Bluetooth proxy that last held the link.** Only offered when the proxy is known *and* it exposes a `restart_proxy` **ESPHome API action** (`api:` → `actions:` → `- action: restart_proxy` in the proxy's YAML, which is how these proxies expose it - a Restart *button* entity is not the same thing and is not what this looks for). The action is found as `esphome.<node name>_restart_proxy`, derived from the proxy's own ESPHome node name rather than whatever it has been renamed to in Home Assistant. Because the BedJet's single connection slot looks occupied to everything else, a proxy still holding a dead link is a failure no reload can clear - only the proxy can. The proxy firmware refuses to restart within 20 minutes of booting, so the wizard reports this as *asked to restart*, never as *rebooted*.
+4. **Cut and restore mains power.** Last resort: pick the switch that feeds the BedJet, and the wizard turns it off, waits ten seconds, and turns it back on. The chosen switch is remembered for next time.
+
+Each step re-checks the link for up to 45 seconds (60 after a power cycle) before reporting back. The repair clears itself the moment the link is healthy again, whether the wizard, an automation, or the device itself fixed it - it is reconciled against the live link on every connect and disconnect and once more whenever the integration is set up, so it can never outlive the outage it describes.
+
+"Healthy" here means connected *and* streaming: since the BedJet emits a status frame about four times a second for as long as a real link is held, a connection producing no frames is a wedged link, not a working one. Entities that still show their last known values are not evidence of a live link.
+
 ## Installation
 
 ### HACS (recommended)
