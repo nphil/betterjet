@@ -10,16 +10,10 @@ from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
-from .coordinator import (
-    BedJetCoordinator,
-    async_forget_link,
-    async_reconcile_link,
-    unreachable_issue_id,
-)
+from .coordinator import BedJetCoordinator
 from .pybedjet import BedJet
 import contextlib
 import voluptuous as vol
@@ -55,21 +49,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
 
     ConfigEntryNotReady is only raised for the one case more waiting cannot
     fix: this address has never been seen by Home Assistant's Bluetooth
-    stack at all, so there is no BLEDevice to connect to yet. That is also
-    the most total outage there is, so the `device_unreachable` countdown is
-    started *before* the raise: nothing after it runs, Home Assistant retries
-    setup on a backoff for as long as the device stays silent, and a
-    countdown that only started once setup succeeded would never start at
-    all: a sibling BLE integration's entry (the living-room vent fan) sat in
-    `setup_retry` overnight on 2026-09-09 with no repair for exactly this
-    reason. The countdown is idempotent per address, so those retries cannot
-    push its deadline out.
+    stack at all, so there is no BLEDevice to connect to yet. Home Assistant
+    retries setup on its own backoff for as long as the device stays silent;
+    entities simply report unavailable until an advertisement arrives.
     """
     _async_register_services(hass)
     address: str = entry.data[CONF_ADDRESS]
     service_info = bluetooth.async_last_service_info(hass, address, connectable=True)
     if service_info is None:
-        async_reconcile_link(hass, address, entry.title, healthy=False)
         raise ConfigEntryNotReady(
             f"BedJet {address} has not been seen by Bluetooth yet"
         )
@@ -112,13 +99,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
     # wait for a connection to actually succeed.
     await device.start()
 
-    # The one reconciliation that runs after a config entry reload, and so the
-    # one that stops a `device_unreachable` repair from outliving the outage it
-    # describes: reloading builds a brand-new coordinator, whose in-memory view
-    # of "was an issue open?" is empty by construction. It also starts the
-    # 15-minute countdown when the link is already down at setup.
-    coordinator.async_reconcile_unreachable_issue()
-
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     async def _async_stop(event: Event) -> None:
@@ -137,13 +117,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> b
     if unload_ok:
         await entry.runtime_data.device.stop()
     return unload_ok
-
-
-async def async_remove_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> None:
-    """Forget the link's outage clock and its repair along with the entry."""
-    address: str = entry.data[CONF_ADDRESS]
-    async_forget_link(hass, address)
-    ir.async_delete_issue(hass, DOMAIN, unreachable_issue_id(address))
 
 
 # ---------------------------------------------------------------------------

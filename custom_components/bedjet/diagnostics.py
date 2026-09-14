@@ -6,8 +6,6 @@ from typing import Any
 
 from bluetooth_data_tools import monotonic_time_coarse
 
-from homeassistant.components import bluetooth
-from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 
 from . import BedJetConfigEntry
@@ -30,26 +28,14 @@ async def async_get_config_entry_diagnostics(
     now = monotonic_time_coarse()
     last_frame_at = device.last_frame_at
 
-    address: str = entry.data[CONF_ADDRESS]
-    service_info = bluetooth.async_last_service_info(hass, address, connectable=True)
-
     return {
         "connection": {
             "connected": device.connected,
             "available": device.available,
-            "scanner_source": device.scanner_source,
             "hold": device.hold_connection,
-            "drops_1h": device.drops_1h,
-            "last_drop": (
-                device.last_drop.isoformat() if device.last_drop is not None else None
-            ),
-            "reconnect_attempt": device.reconnect_attempt,
             "last_frame_at": last_frame_at,
             "seconds_since_last_frame": (
                 round(now - last_frame_at, 1) if last_frame_at is not None else None
-            ),
-            "advertisement_age_seconds": (
-                round(now - service_info.time, 1) if service_info is not None else None
             ),
         },
         "state": None

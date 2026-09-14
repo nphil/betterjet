@@ -90,13 +90,6 @@ SENSORS = (
         translation_key="update_phase",
         value_fn=lambda device: device.state.update_phase,
     ),
-    BedJetSensorEntityDescription(
-        key="scanner",
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        translation_key="scanner",
-        value_fn=lambda device: device.scanner_source,
-    ),
 )
 
 # The one sensor an automation is expected to read while the link is *down*,
@@ -145,7 +138,7 @@ class BedJetSensorEntity(BedJetEntity, SensorEntity):
     @callback
     def _async_update_attrs(self) -> None:
         """Handle updating _attr values."""
-        if self.entity_description.key != "scanner" and self.coordinator.data is None:
+        if self.coordinator.data is None:
             return
         self._attr_native_value = self.entity_description.value_fn(self._device)
 
@@ -156,9 +149,7 @@ class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):
     Exists so a heal automation can tell *which* proxy to restart - and, just
     as importantly, can leave alone a proxy that other devices are holding.
     The state is the scanner's display name while a link is held, or the
-    literal "disconnected"; the attributes carry the hold/drop bookkeeping
-    the library tracks (habluetooth counts connect failures but never
-    post-connect drops, so `drops_1h` has no other source).
+    literal "disconnected".
     """
 
     entity_description = CONNECTION_SENSOR
@@ -202,14 +193,6 @@ class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):
     @callback
     def _async_update_attrs(self) -> None:
         """Handle updating _attr values."""
-        device = self._device
         self._attr_native_value = (
             self.coordinator.connection_scanner_name or STATE_DISCONNECTED
         )
-        last_drop = device.last_drop
-        self._attr_extra_state_attributes = {
-            "hold": device.hold_connection,
-            "drops_1h": device.drops_1h,
-            "last_drop": last_drop.isoformat() if last_drop is not None else None,
-            "reconnect_attempt": device.reconnect_attempt,
-        }
