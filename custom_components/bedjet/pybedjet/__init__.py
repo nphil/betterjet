@@ -41,6 +41,7 @@ import time
 from bleak import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+import bleak_retry_connector
 from bleak_retry_connector import BleakClientWithServiceCache, BleakError, establish_connection
 
 from .codec import (
@@ -294,6 +295,7 @@ class BedJet:
         hold_connection: bool = True,
         clock: Callable[[], datetime] | None = None,
         source: str | None = None,
+        client_class: type[BleakClientWithServiceCache] | None = None,
     ) -> None:
         """Init the BedJet client. Does not connect - call `start()`."""
         self._ble_device = ble_device
@@ -301,6 +303,18 @@ class BedJet:
         self._scanner_source = source
         self._clock = clock
         self._hold_connection = hold_connection
+        # Resolved from the live module attribute rather than this file's own
+        # frozen top-of-file import: Home Assistant's `bluetooth` component
+        # monkeypatches `bleak_retry_connector.BleakClientWithServiceCache`
+        # into its own connection-tracking wrapper, and a caller building
+        # this before that patch lands still needs the current class, not
+        # whichever one existed when this module was first imported.
+        self._client_class = client_class or bleak_retry_connector.BleakClientWithServiceCache
+        # True if the most recent connect attempt used a caller-preferred
+        # scanner. This class has no notion of "preferred" - whatever built
+        # `client_class` (see ble_affinity.py) sets this via its on_choice
+        # hook; Home Assistant's Connection sensor surfaces it.
+        self.via_preferred_proxy = False
 
         self._client: BleakClientWithServiceCache | None = None
         self._state: BedJetState | None = None
@@ -698,7 +712,7 @@ class BedJet:
     async def _connect_once(self) -> None:
         async with asyncio.timeout(CONNECT_ATTEMPT_TIMEOUT_S):
             client = await establish_connection(
-                BleakClientWithServiceCache,
+                self._client_class,
                 self._ble_device,
                 self.address,
                 self._handle_disconnect,

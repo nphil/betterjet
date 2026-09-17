@@ -232,6 +232,34 @@ def install() -> bool:
     config_entries.ConfigFlowResult = dict
     config_entries.ConfigFlow = ConfigFlow
 
+    class OptionsFlow:
+        """Behavioral subset of HA's OptionsFlow used by options-flow tests."""
+
+        hass = None
+        config_entry = None
+
+        def async_show_form(self, *, step_id: str, data_schema=None, errors=None, description_placeholders=None):
+            return {
+                "type": "form",
+                "step_id": step_id,
+                "data_schema": data_schema,
+                "errors": errors,
+                "description_placeholders": description_placeholders,
+            }
+
+        def async_create_entry(self, *, title: str, data):
+            return {"type": "create_entry", "title": title, "data": data}
+
+    class OptionsFlowWithReload(OptionsFlow):
+        """Real HA reloads the entry automatically once options are saved;
+        not modeled here since these tests assert on the returned
+        FlowResult, not a live reload - this only has to exist for the
+        modern import in config_flow.py to succeed instead of falling back.
+        """
+
+    config_entries.OptionsFlow = OptionsFlow
+    config_entries.OptionsFlowWithReload = OptionsFlowWithReload
+
     # -- homeassistant.components(.bluetooth[.match]) ------------------------
     components = _module("homeassistant.components")
     bluetooth = _module("homeassistant.components.bluetooth")
@@ -290,6 +318,12 @@ def install() -> bool:
     def async_scanner_by_source(hass, source):
         return None
 
+    def async_current_scanners(hass):
+        # The preferred-proxy options flow lists these; tests monkeypatch
+        # this to return fake scanners rather than exercising real
+        # habluetooth scanner registration.
+        return []
+
     bluetooth.BluetoothScanningMode = BluetoothScanningMode
     bluetooth.BluetoothChange = BluetoothChange
     bluetooth.BluetoothServiceInfoBleak = BluetoothServiceInfoBleak
@@ -298,6 +332,7 @@ def install() -> bool:
     bluetooth.async_last_service_info = async_last_service_info
     bluetooth.async_register_callback = async_register_callback
     bluetooth.async_scanner_by_source = async_scanner_by_source
+    bluetooth.async_current_scanners = async_current_scanners
 
     # -- habluetooth ---------------------------------------------------------
     # habluetooth ships inside Home Assistant, not in this fork's test deps.
@@ -692,6 +727,29 @@ def install() -> bool:
 
     selector.EntitySelectorConfig = EntitySelectorConfig
     selector.EntitySelector = EntitySelector
+
+    class SelectSelectorConfig(dict):
+        """Real type is a TypedDict; a plain dict is a faithful stand-in."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    class SelectSelectorMode(Enum):
+        LIST = "list"
+        DROPDOWN = "dropdown"
+
+    class SelectSelector:
+        """Selectors are voluptuous validators, so this stays callable."""
+
+        def __init__(self, config=None) -> None:
+            self.config = config or {}
+
+        def __call__(self, data):
+            return data
+
+    selector.SelectSelectorConfig = SelectSelectorConfig
+    selector.SelectSelectorMode = SelectSelectorMode
+    selector.SelectSelector = SelectSelector
 
     update_coordinator = _module("homeassistant.helpers.update_coordinator")
     helpers.update_coordinator = update_coordinator

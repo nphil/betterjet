@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import bleak_retry_connector
 import pytest
 
 import custom_components.bedjet as bedjet_init
@@ -28,7 +29,9 @@ ADDRESS = "FC:F5:C4:20:1A:92"
 class FakeBedJet:
     instances: list["FakeBedJet"] = []
 
-    def __init__(self, ble_device, advertisement_data, *, source=None, clock=None) -> None:
+    def __init__(
+        self, ble_device, advertisement_data, *, source=None, clock=None, client_class=None
+    ) -> None:
         self.ble_device = ble_device
         self.advertisement_data = advertisement_data
         self.source = source
@@ -39,6 +42,7 @@ class FakeBedJet:
         self.set_ble_calls: list[tuple] = []
         self.state = SimpleNamespace(sentinel=True)
         self.address = ADDRESS
+        self.client_class = client_class
         self.connected = False
         # Setup reconciles the `device_unreachable` repair against the live
         # link, so the fake has to answer the same freshness question the
@@ -112,6 +116,7 @@ class FakeHass:
 class FakeEntry:
     def __init__(self, address: str = ADDRESS) -> None:
         self.data = {CONF_ADDRESS: address}
+        self.options: dict = {}
         self.title = "Bedjetty"
         self.runtime_data = None
         self._unload_callbacks: list = []
@@ -236,3 +241,40 @@ def test_unload_entry_stops_device_and_unloads_platforms(monkeypatch, patched_be
     assert result is True
     assert device.stopped is True
     assert hass.config_entries.unloaded[-1][0] is entry
+
+
+def test_setup_builds_an_affinity_client_class_when_habluetooth_supports_it(
+    monkeypatch, patched_bedjet
+) -> None:
+    """Regression: setup must build the client class through
+    ble_affinity.make_affinity_client_class - handing BedJet the plain
+    bleak_retry_connector base straight through would silently disable the
+    preferred-proxy option. `bleak_retry_connector.BleakClientWithServiceCache`
+    is monkeypatched here to a fake exposing the habluetooth selection hooks
+    (affinity_supported() requires them), standing in for what Home
+    Assistant's real `bluetooth` component installs at runtime.
+    """
+
+    class FakeBaseWithHooks:
+        def _async_get_best_available_backend_and_device(self, manager):
+            return None
+
+        def _async_get_backend_for_ble_device(self, manager, scanner, ble_device):
+            return None
+
+    monkeypatch.setattr(bleak_retry_connector, "BleakClientWithServiceCache", FakeBaseWithHooks)
+    service_info = SimpleNamespace(device=object(), advertisement=object(), source="D4:D4:DA:9D:40:8A")
+    monkeypatch.setattr(
+        bedjet_init.bluetooth,
+        "async_last_service_info",
+        lambda hass, address, connectable=True: service_info,
+    )
+    hass = FakeHass()
+    entry = FakeEntry()
+
+    asyncio.run(bedjet_init.async_setup_entry(hass, entry))
+
+    client_class = FakeBedJet.instances[-1].client_class
+    assert client_class is not None
+    assert client_class is not FakeBaseWithHooks
+    assert issubclass(client_class, FakeBaseWithHooks)

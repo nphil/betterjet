@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+import bleak_retry_connector
+
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
@@ -12,7 +14,8 @@ from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
+from .ble_affinity import make_affinity_client_class
+from .const import CONF_PREFERRED_PROXY, DOMAIN
 from .coordinator import BedJetCoordinator
 from .pybedjet import BedJet
 import contextlib
@@ -61,11 +64,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
             f"BedJet {address} has not been seen by Bluetooth yet"
         )
 
+    @callback
+    def _on_proxy_choice(_scanner_name: str, preferred_used: bool) -> None:
+        """Record whether the last connect attempt used the preferred proxy.
+
+        Only fires once a preferred proxy is configured (see
+        ble_affinity.make_affinity_client_class); the Connection sensor
+        reads `device.via_preferred_proxy` for its diagnostic attribute.
+        """
+        device.via_preferred_proxy = preferred_used
+
+    # Resolved at call time, not this module's own frozen import: Home
+    # Assistant's `bluetooth` component monkeypatches
+    # `bleak_retry_connector.BleakClientWithServiceCache` into its own
+    # connection-tracking wrapper, and habluetooth ignores whatever
+    # BLEDevice is handed to it on every connect - overriding backend
+    # selection is the only way to express "connect through this proxy".
+    # See ble_affinity.py.
+    client_class = make_affinity_client_class(
+        bleak_retry_connector.BleakClientWithServiceCache,
+        lambda: entry.options.get(CONF_PREFERRED_PROXY) or None,
+        on_choice=_on_proxy_choice,
+    )
+
     device = BedJet(
         service_info.device,
         service_info.advertisement,
         source=service_info.source,
         clock=dt_util.now,
+        client_class=client_class,
     )
 
     @callback
@@ -131,13 +158,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> b
 # slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
 # rebooting the proxy holding each stale link freed them).
 #
-# The proxies now release their links themselves 25 s after losing their API
-# client, which covers every way HA can vanish including a crash or a power
-# cut. This action is the cooperative path for the case HA *is* still running:
-# it releases the link before the restart rather than during it. Implemented by
-# unloading the entry, because async_unload_entry already runs the coordinator's async_shutdown, which
-# unregisters the device callback and drops the single connection this device
-# allows. Anything gentler leaves that one slot occupied.
+# Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
+# on-API-loss release hook, and rebooting a proxy is not a cure either - it
+# re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
+# post-reboot connection). The only clean path is to drop the link while HA and
+# its Bluetooth stack are both still alive, which is what this action does:
+# `script.safe_restart` calls it on every BLE integration and only then restarts
+# Core. Implemented by unloading the entry, because async_unload_entry already
+# runs the coordinator's async_shutdown, which unregisters the device callback
+# and drops the single connection this device allows. Anything gentler leaves
+# that one slot occupied. A ghost that forms anyway is caught by
+# `automation.ble_ghost_link_detector` and freed with the holding proxy's
+# `force_disconnect_orphan` action (HCI disconnect by handle).
 #
 # `resume_after` sets the entry up again if no restart follows, so an operator
 # who calls this and changes their mind is not left with a dead device that

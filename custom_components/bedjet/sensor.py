@@ -19,6 +19,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import BedJetConfigEntry
+from .const import CONF_PREFERRED_PROXY
 from .entity import BedJetEntity
 from .pybedjet import BedJet, BedJetNotification
 
@@ -149,7 +150,9 @@ class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):
     Exists so a heal automation can tell *which* proxy to restart - and, just
     as importantly, can leave alone a proxy that other devices are holding.
     The state is the scanner's display name while a link is held, or the
-    literal "disconnected".
+    literal "disconnected". Attributes carry the configured preferred-proxy
+    affinity (see ble_affinity.py) and whether the last connect actually
+    used it.
     """
 
     entity_description = CONNECTION_SENSOR
@@ -196,3 +199,9 @@ class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):
         self._attr_native_value = (
             self.coordinator.connection_scanner_name or STATE_DISCONNECTED
         )
+        self._attr_extra_state_attributes = {
+            "preferred_proxy": (
+                self.coordinator.config_entry.options.get(CONF_PREFERRED_PROXY) or None
+            ),
+            "via_preferred_proxy": self._device.via_preferred_proxy,
+        }

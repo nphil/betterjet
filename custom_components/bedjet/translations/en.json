@@ -22,6 +22,15 @@
       }
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "preferred_proxy": "Preferred proxy"
+        }
+      }
+    }
+  },
   "entity": {
     "binary_sensor": {
       "connection_test": {
@@ -93,6 +102,13 @@
       },
       "mute_beeps": {
         "name": "Mute beeps"
+      }
+    }
+  },
+  "selector": {
+    "preferred_proxy": {
+      "options": {
+        "": "Automatic (strongest signal)"
       }
     }
   }

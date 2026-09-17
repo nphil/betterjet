@@ -1,16 +1,16 @@
-"""Tests for the BedJet sensor platform: unique_ids, values, the scanner
-sensor's exemption from the "no data yet" guard (it must work even while the
-device has never decoded a frame, since it just reports proxy attribution),
-and the Connection diagnostic sensor that names the proxy holding the link.
+"""Tests for the BedJet sensor platform: unique_ids, values, and the
+Connection diagnostic sensor - which proxy holds the link, plus the
+preferred-proxy affinity attributes ble_affinity.py's client_class reports
+back through (see custom_components.bedjet.__init__._on_proxy_choice).
 """
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import custom_components.bedjet.sensor as sensor
+from custom_components.bedjet.const import CONF_PREFERRED_PROXY
 from custom_components.bedjet.pybedjet.const import BedJetNotification
 from custom_components.bedjet.sensor import (
     CONNECTION_SENSOR,
@@ -28,11 +28,8 @@ class FakeDevice:
     def __init__(self) -> None:
         self.address = ADDRESS
         self.scanner_source = "D4:D4:DA:9D:40:8A"
-        self.hold_connection = True
         self.connected = True
-        self.drops_1h = 0
-        self.last_drop = None
-        self.reconnect_attempt = 0
+        self.via_preferred_proxy = False
         self.state = SimpleNamespace(
             ambient_temp_c=24.5,
             actual_temp_c=25.0,
@@ -50,6 +47,7 @@ class FakeCoordinator:
         self.available = True
         self.data = device.state
         self.connection_scanner_name: str | None = "master-bedroom-bluetooth-proxy"
+        self.config_entry = SimpleNamespace(options={})
 
     def async_add_listener(self, update_callback, context=None):
         return lambda: None
@@ -125,7 +123,7 @@ def test_notification_none_member_renders_as_string_not_python_none() -> None:
 
 
 def test_diagnostic_sensors_are_disabled_by_default() -> None:
-    for key in ("bio_sequence_step", "shutdown_reason", "turbo_time", "update_phase", "scanner"):
+    for key in ("bio_sequence_step", "shutdown_reason", "turbo_time", "update_phase"):
         descriptor = descriptor_by_key(key)
         assert descriptor.entity_registry_enabled_default is False
 
@@ -142,18 +140,6 @@ def test_notification_is_enabled_default_with_no_category() -> None:
     descriptor = descriptor_by_key("notification")
     assert descriptor.entity_category is None
     assert descriptor.entity_registry_enabled_default is True
-
-
-def test_scanner_sensor_updates_even_without_a_decoded_frame_yet() -> None:
-    device = FakeDevice()
-    coordinator = FakeCoordinator(device)
-    coordinator.data = None  # no status frame decoded yet
-    entity = BedJetSensorEntity(coordinator, "Bedjetty", descriptor_by_key("scanner"))
-
-    device.scanner_source = "AA:BB:CC:DD:EE:FF"
-    entity._async_update_attrs()
-
-    assert entity.native_value == "AA:BB:CC:DD:EE:FF"
 
 
 def test_non_scanner_sensor_skips_update_without_a_decoded_frame() -> None:
@@ -209,34 +195,30 @@ class TestConnectionSensor:
         coordinator.available = False
         coordinator.data = None  # no frame has ever decoded
         coordinator.connection_scanner_name = None
-        device.drops_1h = 3
-        device.reconnect_attempt = 2
 
         entity._async_update_attrs()
 
         assert entity.available is True
         assert entity.native_value == STATE_DISCONNECTED
-        assert entity.extra_state_attributes["drops_1h"] == 3
-        assert entity.extra_state_attributes["reconnect_attempt"] == 2
 
-    def test_attributes_report_hold_and_drop_bookkeeping(self, monkeypatch) -> None:
-        entity, _coordinator, device, _manager = self.make(monkeypatch)
-        device.drops_1h = 2
-        device.last_drop = datetime(2026, 9, 8, 3, 15, 30, tzinfo=UTC)
-        device.reconnect_attempt = 0
+    def test_extra_state_attributes_report_the_configured_preference_and_last_choice(
+        self, monkeypatch
+    ) -> None:
+        entity, coordinator, device, _manager = self.make(monkeypatch)
+        coordinator.config_entry.options = {CONF_PREFERRED_PROXY: "plant-room-bluetooth-proxy"}
+        device.via_preferred_proxy = True
 
         entity._async_update_attrs()
 
         assert entity.extra_state_attributes == {
-            "hold": True,
-            "drops_1h": 2,
-            "last_drop": "2026-09-08T03:15:30+00:00",
-            "reconnect_attempt": 0,
+            "preferred_proxy": "plant-room-bluetooth-proxy",
+            "via_preferred_proxy": True,
         }
 
-    def test_last_drop_is_none_before_any_drop(self, monkeypatch) -> None:
+    def test_preferred_proxy_attribute_is_none_when_automatic(self, monkeypatch) -> None:
         entity, _coordinator, _device, _manager = self.make(monkeypatch)
-        assert entity.extra_state_attributes["last_drop"] is None
+        assert entity.extra_state_attributes["preferred_proxy"] is None
+        assert entity.extra_state_attributes["via_preferred_proxy"] is False
 
     def test_allocation_change_republishes_the_new_holder(self, monkeypatch) -> None:
         entity, coordinator, _device, manager = self.make(monkeypatch)

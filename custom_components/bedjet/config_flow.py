@@ -11,12 +11,27 @@ import voluptuous as vol
 
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
+    async_current_scanners,
     async_discovered_service_info,
 )
-from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_ADDRESS
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
-from .const import BEDJET_SERVICE_UUID, DOMAIN, LOCAL_NAME_PREFIX
+try:
+    from homeassistant.config_entries import OptionsFlowWithReload as OptionsFlowBase
+
+    _OPTIONS_FLOW_NEEDS_ENTRY = False
+except ImportError:  # Home Assistant before 2025.8
+    from homeassistant.config_entries import OptionsFlow as OptionsFlowBase  # type: ignore[no-redef]
+
+    _OPTIONS_FLOW_NEEDS_ENTRY = True
+
+from .const import BEDJET_SERVICE_UUID, CONF_PREFERRED_PROXY, DOMAIN, LOCAL_NAME_PREFIX
 from .pybedjet import BedJet
 
 _LOGGER = logging.getLogger(__name__)
@@ -157,4 +172,68 @@ class BedjetDeviceConfigFlow(ConfigFlow, domain=DOMAIN):
             step_id="user",
             data_schema=data_schema,
             errors=errors,
+        )
+
+    @staticmethod
+    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
+        """Return the options flow handler."""
+        if _OPTIONS_FLOW_NEEDS_ENTRY:
+            return OptionsFlowHandler(config_entry)
+        return OptionsFlowHandler()
+
+
+class OptionsFlowHandler(OptionsFlowBase):
+    """Handle the "preferred proxy" option.
+
+    ``OptionsFlowWithReload`` reloads the entry automatically once options
+    are saved, which is the only way a new `client_class` (see
+    ``ble_affinity.py``) picks up the change - the legacy constructor
+    argument below only matters on Home Assistant releases before that
+    class existed.
+    """
+
+    def __init__(self, legacy_config_entry: ConfigEntry | None = None) -> None:
+        super().__init__()
+        self._legacy_config_entry = legacy_config_entry
+
+    def _config_entry(self) -> ConfigEntry:
+        """Return the entry on both legacy and current options-flow APIs."""
+        if self._legacy_config_entry is not None:
+            return self._legacy_config_entry
+        return self.config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show and handle the "preferred proxy" form."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        entry = self._config_entry()
+        current = entry.options.get(CONF_PREFERRED_PROXY, "")
+        # ESPHome node names of proxies Home Assistant can connect through
+        # right now; a proxy the operator already picked stays listed even
+        # if it is offline, so saving the form again cannot silently drop it.
+        proxies = {
+            scanner.adapter
+            for scanner in async_current_scanners(self.hass)
+            if scanner.connectable and getattr(scanner, "adapter", None)
+        }
+        if current:
+            proxies.add(current)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_PREFERRED_PROXY, default=current): SelectSelector(
+                        SelectSelectorConfig(
+                            options=["", *sorted(proxies)],
+                            mode=SelectSelectorMode.DROPDOWN,
+                            custom_value=True,
+                            translation_key=CONF_PREFERRED_PROXY,
+                        )
+                    ),
+                }
+            ),
         )
