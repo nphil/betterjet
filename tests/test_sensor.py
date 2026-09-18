@@ -89,13 +89,83 @@ def test_all_unique_ids_are_address_prefixed_by_key() -> None:
 
 
 def test_ambient_temperature_value() -> None:
+    # FakeDevice reports 24.5C raw; a fresh entity's first reading quantizes
+    # to a whole number (round(24.5) == 24 - see TestTemperatureQuantization
+    # below and test_temperature.py for the hysteresis this exercises).
     entity, _coordinator, _device = make_entity("ambient_temperature")
-    assert entity.native_value == 24.5
+    assert entity.native_value == 24
 
 
 def test_outlet_temperature_value() -> None:
+    # FakeDevice reports 25.0C raw, already whole - quantizing a value
+    # already on the grid must not perturb it.
     entity, _coordinator, _device = make_entity("outlet_temperature")
     assert entity.native_value == 25.0
+
+
+class TestTemperatureQuantization:
+    """Ambient/outlet publish whole degrees with hysteresis (temperature.py).
+    Every other sensor here is a plain value_fn passthrough, unaffected.
+    """
+
+    def test_ambient_and_outlet_set_whole_number_display_precision(self) -> None:
+        for key in ("ambient_temperature", "outlet_temperature"):
+            entity, _coordinator, _device = make_entity(key)
+            assert entity._attr_suggested_display_precision == 0
+
+    def test_non_temperature_sensors_do_not_set_display_precision(self) -> None:
+        for key in (
+            "notification",
+            "bio_sequence_step",
+            "shutdown_reason",
+            "turbo_time",
+            "update_phase",
+        ):
+            entity, _coordinator, _device = make_entity(key)
+            assert not hasattr(entity, "_attr_suggested_display_precision")
+
+    def test_dither_across_a_boundary_does_not_keep_changing(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator, _device = make_entity("ambient_temperature", device)
+        readings = []
+        for raw in (24.5, 25.0, 24.5, 25.0):
+            device.state = SimpleNamespace(**{**device.state.__dict__, "ambient_temp_c": raw})
+            entity._async_update_attrs()
+            readings.append(entity.native_value)
+        # round(24.5) == 24 seeds the first reading; the very next reading
+        # (25.0) is a full 1C from that seed - past the 0.8C deadband - so
+        # it takes one settling step to lock on. Every reading after that
+        # must be identical, unlike the raw signal, which keeps alternating
+        # every step - that alternation is the 8.2 rows/min regression.
+        assert readings[0] == 24
+        assert readings[1] == readings[2] == readings[3] == 25
+
+    def test_real_move_past_the_deadband_does_get_published(self) -> None:
+        device = FakeDevice()
+        entity, _coordinator, _device = make_entity("outlet_temperature", device)
+        assert entity.native_value == 25.0
+        device.state = SimpleNamespace(**{**device.state.__dict__, "actual_temp_c": 26.0})
+        entity._async_update_attrs()
+        assert entity.native_value == 26.0
+
+    def test_each_entity_keeps_its_own_published_state(self) -> None:
+        # Regression guard for the shared-descriptor trap: SENSORS is one
+        # module-level tuple of descriptors reused for every entity built
+        # from it, so a quantizer stored on the descriptor instead of the
+        # entity would be shared across ambient and outlet (and across every
+        # BedJet config entry). ambient's first reading (24.5) publishes 24;
+        # if outlet shared that quantizer instead of owning its own, its
+        # first reading (24.6, only 0.6C from ambient's 24) would fall
+        # inside the 0.8C deadband and get suppressed to ambient's stale 24
+        # instead of publishing its own round(24.6) == 25.
+        device = FakeDevice()
+        device.state = SimpleNamespace(
+            **{**device.state.__dict__, "ambient_temp_c": 24.5, "actual_temp_c": 24.6}
+        )
+        ambient, _coordinator1, _d1 = make_entity("ambient_temperature", device)
+        outlet, _coordinator2, _d2 = make_entity("outlet_temperature", device)
+        assert ambient.native_value == 24
+        assert outlet.native_value == 25
 
 
 def test_notification_value_is_lowercase_enum_name() -> None:

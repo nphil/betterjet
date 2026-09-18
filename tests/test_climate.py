@@ -32,7 +32,7 @@ from custom_components.bedjet.climate import (
 from custom_components.bedjet.pybedjet import BedJetCommandError
 from custom_components.bedjet.pybedjet.const import BedJetButton, BedJetMode
 from homeassistant.components.climate import HVACMode
-from homeassistant.const import ATTR_TEMPERATURE
+from homeassistant.const import ATTR_TEMPERATURE, PRECISION_WHOLE
 from homeassistant.exceptions import HomeAssistantError
 
 ADDRESS = "FC:F5:C4:20:1A:92"
@@ -197,6 +197,62 @@ class TestModeMapping:
         coordinator.data = make_state(mode=mode)
         entity._async_update_attrs()
         assert entity.preset_mode == preset
+
+
+class TestCurrentTemperatureQuantization:
+    """current_temperature publishes whole degrees with hysteresis - see
+    temperature.py. Never applies to target_temperature (see
+    TestTargetTemperatureIsNeverQuantized): that is a setpoint the user
+    chose, not a measured value with its own noise to smooth out.
+    """
+
+    def test_precision_is_whole_degrees(self) -> None:
+        entity, _coordinator = make_entity()
+        assert entity.precision == PRECISION_WHOLE
+
+    def test_first_reading_publishes_a_whole_number(self) -> None:
+        coordinator = FakeCoordinator(FakeDevice())
+        coordinator.data = make_state(actual_temp_c=24.7)
+        entity = BedJetClimateEntity(coordinator, "Bedjetty")
+        assert entity.current_temperature == 25
+
+    def test_dither_across_a_boundary_does_not_keep_changing(self) -> None:
+        # The unit dithers by exactly one 0.5C step while parked on a
+        # boundary (measured live: current_temperature alternated 76/77F -
+        # 24.5/25.0C - every ~2s for hours, 1132 recorder rows in 7.5h).
+        coordinator = FakeCoordinator(FakeDevice())
+        coordinator.data = make_state(actual_temp_c=24.5)
+        entity = BedJetClimateEntity(coordinator, "Bedjetty")
+        readings = [entity.current_temperature]
+        for raw in (25.0, 24.5, 25.0):
+            coordinator.push(make_state(actual_temp_c=raw))
+            readings.append(entity.current_temperature)
+        # round(24.5) == 24 seeds the first reading; the very next reading
+        # (25.0) is a full 1C from that seed - past the 0.8C deadband - so
+        # it takes one settling step to lock on. Every reading after that
+        # must be identical, unlike the raw signal, which keeps alternating.
+        assert readings[0] == 24
+        assert readings[1] == readings[2] == readings[3] == 25
+
+    def test_real_move_past_the_deadband_does_get_published(self) -> None:
+        entity, coordinator = make_entity()
+        assert entity.current_temperature == 25.0  # construction reading
+        coordinator.push(make_state(actual_temp_c=26.0))
+        assert entity.current_temperature == 26.0
+
+
+class TestTargetTemperatureIsNeverQuantized:
+    """A setpoint the user chose must be reported back exactly as set."""
+
+    def test_whole_number_setpoint_is_unaffected(self) -> None:
+        entity, coordinator = make_entity()
+        coordinator.push(make_state(target_temp_c=33.0))
+        assert entity.target_temperature == 33.0
+
+    def test_half_degree_setpoint_is_reported_exactly(self) -> None:
+        entity, coordinator = make_entity()
+        coordinator.push(make_state(target_temp_c=24.5))
+        assert entity.target_temperature == 24.5
 
 
 class TestServiceCalls:

@@ -22,6 +22,7 @@ from . import BedJetConfigEntry
 from .const import CONF_PREFERRED_PROXY
 from .entity import BedJetEntity
 from .pybedjet import BedJet, BedJetNotification
+from .temperature import TemperatureQuantizer
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -134,6 +135,18 @@ class BedJetSensorEntity(BedJetEntity, SensorEntity):
         """Initialize a BedJet sensor entity."""
         self.entity_description = entity_description
         self._attr_unique_id = f"{coordinator.device.address}_{entity_description.key}"
+        # Ambient/outlet are measured temperatures: the device dithers by
+        # its own 0.5C step while parked on a boundary, and plain rounding
+        # cannot absorb that because the dither *is* the rounding grid's
+        # quantum (round(24.5) == 24 but round(25.0) == 25) - see
+        # temperature.py. One quantizer per entity instance, created before
+        # the base class's __init__ calls _async_update_attrs() below.
+        # Every other sensor here (notification, bio_sequence_step, ...) is
+        # not a temperature and passes its value_fn result through as-is.
+        self._quantizer: TemperatureQuantizer | None = None
+        if entity_description.device_class is SensorDeviceClass.TEMPERATURE:
+            self._quantizer = TemperatureQuantizer()
+            self._attr_suggested_display_precision = 0
         super().__init__(coordinator, name)
 
     @callback
@@ -141,7 +154,10 @@ class BedJetSensorEntity(BedJetEntity, SensorEntity):
         """Handle updating _attr values."""
         if self.coordinator.data is None:
             return
-        self._attr_native_value = self.entity_description.value_fn(self._device)
+        value = self.entity_description.value_fn(self._device)
+        if self._quantizer is not None:
+            value = self._quantizer.push(value)
+        self._attr_native_value = value
 
 
 class BedJetConnectionSensorEntity(BedJetEntity, SensorEntity):

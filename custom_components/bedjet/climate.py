@@ -11,7 +11,7 @@ from homeassistant.components.climate import (
     ClimateEntityFeature,
     HVACMode,
 )
-from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
+from homeassistant.const import ATTR_TEMPERATURE, PRECISION_WHOLE, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -19,6 +19,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import BedJetConfigEntry
 from .entity import BedJetEntity
 from .pybedjet import BedJetButton, BedJetMode
+from .temperature import TemperatureQuantizer
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         | ClimateEntityFeature.TURN_ON
     )
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
+    # Whole-degree display: native unit is Celsius, so ClimateEntity's
+    # unit-based default (PRECISION_TENTHS for Celsius) would otherwise show
+    # 0.5C steps the user does not want - see temperature.py for how the
+    # published value itself is also quantized, not just its display.
+    _attr_precision = PRECISION_WHOLE
 
     def __init__(self, coordinator, name: str) -> None:
         """Initialize a BedJet climate entity."""
@@ -112,6 +118,10 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         # Setpoint requested while the unit was in standby, not yet written
         # to the device - see `async_set_temperature`.
         self._deferred_target_c: float | None = None
+        # One quantizer per entity instance - see temperature.py. Must be
+        # created before the base class's __init__ calls
+        # _async_update_attrs() below.
+        self._quantizer = TemperatureQuantizer()
         super().__init__(coordinator, name)
 
     @property
@@ -131,7 +141,13 @@ class BedJetClimateEntity(BedJetEntity, ClimateEntity):
         """Handle updating _attr values."""
         if (state := self.coordinator.data) is None:
             return
-        self._attr_current_temperature = state.actual_temp_c
+        # Whole-degree publish with hysteresis: the device dithers by its
+        # own 0.5C step while parked on a boundary, and plain rounding
+        # cannot absorb that because the dither *is* the rounding grid's
+        # quantum (round(24.5) == 24 but round(25.0) == 25) - see
+        # temperature.py. target_temp_c is a setpoint the user chose, so it
+        # is reported exactly as the device confirms it, never quantized.
+        self._attr_current_temperature = self._quantizer.push(state.actual_temp_c)
         self._attr_target_temperature = state.target_temp_c
         self._attr_fan_mode = f"{state.fan_percent}%"
         self._attr_hvac_mode = MODE_TO_HVAC_MODE.get(state.mode, HVACMode.OFF)

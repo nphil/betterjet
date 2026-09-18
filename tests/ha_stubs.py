@@ -126,6 +126,9 @@ def install() -> bool:
     const.CONF_ENTITY_ID = "entity_id"
     const.SERVICE_TURN_OFF = "turn_off"
     const.SERVICE_TURN_ON = "turn_on"
+    # ClimateEntity._attr_precision (see homeassistant/const.py) - only the
+    # whole-number precision the BedJet climate entity uses is stubbed.
+    const.PRECISION_WHOLE = 1
 
     class UnitOfTemperature(StrEnum):
         CELSIUS = "°C"
