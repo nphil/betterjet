@@ -1,8 +1,9 @@
 """Preferred-proxy affinity for Home Assistant Bluetooth connections.
 
 Vendored verbatim into each nateshome BLE integration (ac_infinity, bedjet,
-fluvalble). Change it here first (`/data/home/tmp/ble_affinity.py` is the
-source of truth) and copy to every integration in the same pass.
+fluvalble, ecoflow_iot). Change it here first
+(`/data/home/tmp/ble_affinity.py` is the source of truth) and copy to every
+integration in the same pass.
 
 Why this exists
 ---------------
