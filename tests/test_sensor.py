@@ -30,6 +30,7 @@ class FakeDevice:
         self.scanner_source = "D4:D4:DA:9D:40:8A"
         self.connected = True
         self.via_preferred_proxy = False
+        self.reconnect_attempt = 0
         self.state = SimpleNamespace(
             ambient_temp_c=24.5,
             actual_temp_c=25.0,
@@ -48,6 +49,18 @@ class FakeCoordinator:
         self.data = device.state
         self.connection_scanner_name: str | None = "master-bedroom-bluetooth-proxy"
         self.config_entry = SimpleNamespace(options={})
+        self.drops_1h = 0
+        self.last_drop: str | None = None
+
+    def connection_attributes(self) -> dict:
+        """Mirror of the real coordinator's payload (see coordinator.py)."""
+        return {
+            "drops_1h": self.drops_1h,
+            "last_drop": self.last_drop,
+            "reconnect_attempt": self.device.reconnect_attempt,
+            "preferred_proxy": self.config_entry.options.get("preferred_proxy") or None,
+            "via_preferred_proxy": self.device.via_preferred_proxy,
+        }
 
     def async_add_listener(self, update_callback, context=None):
         return lambda: None
@@ -271,16 +284,28 @@ class TestConnectionSensor:
         assert entity.available is True
         assert entity.native_value == STATE_DISCONNECTED
 
-    def test_extra_state_attributes_report_the_configured_preference_and_last_choice(
+    def test_extra_state_attributes_report_the_full_link_health_contract(
         self, monkeypatch
     ) -> None:
+        """The payload must match what the other three BLE integrations publish.
+
+        A dashboard template reads these keys across all four integrations, so
+        a missing or renamed key here silently blanks that row rather than
+        failing loudly - which is exactly why this asserts the whole dict.
+        """
         entity, coordinator, device, _manager = self.make(monkeypatch)
         coordinator.config_entry.options = {CONF_PREFERRED_PROXY: "plant-room-bluetooth-proxy"}
         device.via_preferred_proxy = True
+        device.reconnect_attempt = 3
+        coordinator.drops_1h = 2
+        coordinator.last_drop = "2026-09-22T04:39:58+00:00"
 
         entity._async_update_attrs()
 
         assert entity.extra_state_attributes == {
+            "drops_1h": 2,
+            "last_drop": "2026-09-22T04:39:58+00:00",
+            "reconnect_attempt": 3,
             "preferred_proxy": "plant-room-bluetooth-proxy",
             "via_preferred_proxy": True,
         }

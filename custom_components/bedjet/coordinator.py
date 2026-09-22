@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable
+from datetime import UTC, datetime
 import logging
-from typing import Protocol
+import time
+from typing import Any, Protocol
 
 from habluetooth import get_manager
 
@@ -13,9 +16,14 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .const import CONF_PREFERRED_PROXY
 from .pybedjet import BedJet, BedJetState
 
 _LOGGER = logging.getLogger(__name__)
+
+# Trailing window for the drops_1h attribute, matching the other three BLE
+# integrations so one dashboard can compare them without unit surprises.
+DROP_WINDOW_SECONDS = 3600.0
 
 
 class SlotAllocations(Protocol):
@@ -84,13 +92,58 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
         self._unregister_device_callback = device.register_callback(
             self._handle_device_update
         )
-        # Tracks the GATT link edge for the operator-facing INFO log.
+        # Tracks the GATT link edge for the operator-facing INFO log, and for
+        # the drop bookkeeping below.
         self._was_connected = device.connected
+        # Monotonic timestamps of unexpected disconnects, pruned to the window.
+        # A deque bounded only by pruning: a link that flaps once a second for
+        # an hour is 3600 floats, which is not worth a cleverer structure.
+        self._drops: deque[float] = deque()
+        self._last_drop: datetime | None = None
 
     @property
     def available(self) -> bool:
         """Return True while the device is connected and reporting fresh frames."""
         return self.device.available
+
+    @property
+    def drops_1h(self) -> int:
+        """Unexpected disconnects in the trailing hour."""
+        cutoff = time.monotonic() - DROP_WINDOW_SECONDS
+        drops = self._drops
+        while drops and drops[0] < cutoff:
+            drops.popleft()
+        return len(drops)
+
+    @property
+    def last_drop(self) -> str | None:
+        """ISO-8601 UTC timestamp of the most recent drop, or None.
+
+        Never pruned: the window governs only the *count*, and "when did the
+        BedJet last lose its link" stays useful long after the hour is up.
+        """
+        if self._last_drop is None:
+            return None
+        return self._last_drop.isoformat()
+
+    def connection_attributes(self) -> dict[str, Any]:
+        """Attribute payload for the Connection diagnostic sensor.
+
+        Deliberately the same key set the AC Infinity, Fluval and EcoFlow
+        integrations publish, so a single template can read any of them.
+        ``reconnect_attempt`` comes straight from the library's supervisor,
+        which is the only component that knows how many consecutive connects
+        have failed.
+        """
+        return {
+            "drops_1h": self.drops_1h,
+            "last_drop": self.last_drop,
+            "reconnect_attempt": self.device.reconnect_attempt,
+            "preferred_proxy": (
+                self.config_entry.options.get(CONF_PREFERRED_PROXY) or None
+            ),
+            "via_preferred_proxy": self.device.via_preferred_proxy,
+        }
 
     @property
     def connection_source(self) -> str | None:
@@ -134,13 +187,20 @@ class BedJetCoordinator(DataUpdateCoordinator[BedJetState | None]):
 
         The library itself only knows scanner *sources* (MACs); the scanner
         name lives in Home Assistant's Bluetooth registry, so the INFO line
-        operators actually read is emitted from here.
+        operators actually read is emitted from here. The same edge is the
+        only honest place to count drops: it fires once per real transition,
+        so a flapping link cannot inflate the count with repeat callbacks.
         """
         connected = device.connected
         if connected == self._was_connected:
             return
         self._was_connected = connected
         if not connected:
+            # A shutdown deliberately drops the link; counting that as a fault
+            # would make every restart look like a BLE failure.
+            if device.hold_connection:
+                self._drops.append(time.monotonic())
+                self._last_drop = datetime.now(UTC)
             _LOGGER.info("%s: disconnected", device.address)
             return
         _LOGGER.info(

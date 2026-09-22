@@ -25,6 +25,9 @@ class FakeDevice:
         self.available = True
         self.connected = False
         self.scanner_source = "D4:D4:DA:9D:40:8A"
+        self.hold_connection = True
+        self.via_preferred_proxy = False
+        self.reconnect_attempt = 0
         self.state = None
         self._callbacks: list = []
         self.unregister_calls = 0
@@ -46,7 +49,7 @@ class FakeDevice:
 
 
 def make_coordinator(device: FakeDevice) -> BedJetCoordinator:
-    entry = SimpleNamespace(title="Bedjetty")
+    entry = SimpleNamespace(title="Bedjetty", options={})
     return BedJetCoordinator(hass=None, config_entry=entry, device=device)
 
 
@@ -202,3 +205,88 @@ def test_a_failed_scanner_lookup_cannot_swallow_a_state_push(monkeypatch) -> Non
         pass
 
     assert coordinator.data is sentinel_state
+
+
+def test_unexpected_disconnect_is_counted_as_a_drop() -> None:
+    device = FakeDevice()
+    device.connected = True
+    coordinator = make_coordinator(device)
+    assert coordinator.drops_1h == 0
+    assert coordinator.last_drop is None
+
+    device.connected = False
+    device.push(None)
+
+    assert coordinator.drops_1h == 1
+    assert coordinator.last_drop is not None
+
+
+def test_deliberate_shutdown_is_not_counted_as_a_drop() -> None:
+    """Releasing the link on purpose is not a fault.
+
+    Without this, every Home Assistant restart and every heal action would
+    inflate drops_1h and make a healthy BedJet look like the worst device in
+    the house - which is precisely the misattribution these counters exist to
+    prevent.
+    """
+    device = FakeDevice()
+    device.connected = True
+    coordinator = make_coordinator(device)
+
+    device.hold_connection = False  # async_stop_hold / shutdown
+    device.connected = False
+    device.push(None)
+
+    assert coordinator.drops_1h == 0
+    assert coordinator.last_drop is None
+
+
+def test_repeat_callbacks_without_an_edge_do_not_inflate_the_count() -> None:
+    device = FakeDevice()
+    device.connected = True
+    coordinator = make_coordinator(device)
+
+    device.connected = False
+    device.push(None)
+    device.push(None)  # same state, more frames
+    device.push(None)
+
+    assert coordinator.drops_1h == 1
+
+
+def test_drops_outside_the_window_are_pruned(monkeypatch) -> None:
+    device = FakeDevice()
+    device.connected = True
+    coordinator = make_coordinator(device)
+
+    device.connected = False
+    device.push(None)
+    assert coordinator.drops_1h == 1
+
+    # Advance past the trailing window; the count decays, last_drop does not.
+    real_monotonic = coordinator_module.time.monotonic
+    monkeypatch.setattr(
+        coordinator_module.time,
+        "monotonic",
+        lambda: real_monotonic() + coordinator_module.DROP_WINDOW_SECONDS + 1,
+    )
+
+    assert coordinator.drops_1h == 0
+    assert coordinator.last_drop is not None
+
+
+def test_connection_attributes_expose_the_shared_contract() -> None:
+    device = FakeDevice()
+    device.connected = True
+    device.reconnect_attempt = 2
+    device.via_preferred_proxy = True
+    entry = SimpleNamespace(title="Bedjetty", options={"preferred_proxy": "master-bedroom-bluetooth-proxy"})
+    coordinator = BedJetCoordinator(hass=None, config_entry=entry, device=device)
+
+    assert coordinator.connection_attributes() == {
+        "drops_1h": 0,
+        "last_drop": None,
+        "reconnect_attempt": 2,
+        "preferred_proxy": "master-bedroom-bluetooth-proxy",
+        "via_preferred_proxy": True,
+    }
