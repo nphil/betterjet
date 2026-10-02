@@ -43,6 +43,67 @@ SHUTDOWN_RELEASE_TIMEOUT_S = 8
 # hass.data flag set by the first shutdown job: once true this process never
 # sets an entry up (or resumes one after release_link) again.
 KEY_SHUTTING_DOWN = f"{DOMAIN}_shutting_down"
+KEY_RESUME_CANCELS = f"{DOMAIN}_resume_cancels"
+
+
+async def _async_release_device(device: BedJet, title: str) -> None:
+    """Release one device's link for good: latched, bounded, never raises."""
+    started = time.monotonic()
+    try:
+        async with asyncio.timeout(SHUTDOWN_RELEASE_TIMEOUT_S):
+            await device.release_for_shutdown()
+    except asyncio.CancelledError:
+        raise  # Home Assistant itself gave up on the job; not ours to eat
+    except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning(
+            "Could not release BLE link to %s at shutdown within %.0f s: %r",
+            title,
+            SHUTDOWN_RELEASE_TIMEOUT_S,
+            err,
+        )
+        return
+    _LOGGER.info(
+        "Released BLE link to %s at shutdown in %.2f s",
+        title,
+        time.monotonic() - started,
+    )
+
+
+async def _async_release_at_shutdown(
+    hass: HomeAssistant, device: BedJet, title: str
+) -> None:
+    """Per-entry shutdown job: drop the held BLE link while Bluetooth is alive.
+
+    Runs in Home Assistant's first shutdown stage, before the STOP event that
+    tears the Bluetooth stack down. Releases the link only: the entry stays
+    loaded (no entity churn).
+    """
+    _latch_shutdown(hass)
+    await _async_release_device(device, title)
+
+
+@callback
+def _latch_shutdown(hass: HomeAssistant) -> None:
+    """Mark this process as shutting down and cancel every pending resume."""
+    hass.data[KEY_SHUTTING_DOWN] = True
+    for cancel in hass.data.pop(KEY_RESUME_CANCELS, []):
+        cancel()
+
+
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Register the domain-lifetime shutdown latch.
+
+    Per-entry shutdown jobs are removed when an entry unloads (release_link
+    does that), so on their own they could not stop a resume timer firing
+    during shutdown. This job lives for the whole run and is never removed.
+    """
+
+    async def _latch_job() -> None:
+        _latch_shutdown(hass)
+
+    hass.async_add_shutdown_job(HassJob(_latch_job, "bedjet shutdown latch"))
+    return True
+
 
 type BedJetConfigEntry = ConfigEntry[BedJetCoordinator]
 
@@ -106,6 +167,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
         client_class=client_class,
     )
 
+    # Registered immediately - before any further await - because Home
+    # Assistant lists the shutdown jobs once at the start of its first
+    # shutdown stage: a job added later (e.g. after platform forwarding) would
+    # be missed, leaving this device's link to ghost.
+    async def _async_shutdown_job() -> None:
+        await _async_release_at_shutdown(hass, device, entry.title)
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(_async_shutdown_job, f"bedjet release BLE link {entry.title}")
+        )
+    )
+
     @callback
     def _async_update_ble(
         service_info: bluetooth.BluetoothServiceInfoBleak,
@@ -136,42 +210,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
     # Kicks off the maintain-and-reconnect loop; does not
     # wait for a connection to actually succeed.
     await device.start()
+    if hass.data.get(KEY_SHUTTING_DOWN):
+        # Shutdown began during the await above: undo what was just started
+        # (the entry-unload callbacks, including the shutdown job, run when
+        # setup fails) and do not set up platforms.
+        await coordinator.async_shutdown()
+        await _async_release_device(device, entry.title)
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-
-    async def _async_release_at_shutdown() -> None:
-        """Drop the held BLE link while Home Assistant and Bluetooth are alive.
-
-        Runs as a Home Assistant shutdown job, i.e. before the STOP event that
-        tears the Bluetooth stack down. Releases the link only: the entry stays
-        loaded (no entity churn). Bounded, never raises.
-        """
-        hass.data[KEY_SHUTTING_DOWN] = True
-        started = time.monotonic()
-        try:
-            async with asyncio.timeout(SHUTDOWN_RELEASE_TIMEOUT_S):
-                await device.release_for_shutdown()
-        except asyncio.CancelledError:
-            raise  # Home Assistant itself gave up on the job; not ours to eat
-        except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
-            _LOGGER.warning(
-                "Could not release BLE link to %s at shutdown within %.0f s: %r",
-                entry.title,
-                SHUTDOWN_RELEASE_TIMEOUT_S,
-                err,
-            )
-            return
-        _LOGGER.info(
-            "Released BLE link to %s at shutdown in %.2f s",
-            entry.title,
-            time.monotonic() - started,
-        )
-
-    entry.async_on_unload(
-        hass.async_add_shutdown_job(
-            HassJob(_async_release_at_shutdown, f"bedjet release BLE link {entry.title}")
-        )
-    )
     return True
 
 
@@ -240,6 +287,7 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
         return
 
     async def _resume(_now: Any) -> None:
+        cancels.remove(cancel)
         for entry in released:
             if hass.data.get(KEY_SHUTTING_DOWN):
                 return  # shutdown already released the links for good
@@ -252,7 +300,11 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             resume_after,
         )
 
-    async_call_later(hass, resume_after, _resume)
+    if hass.data.get(KEY_SHUTTING_DOWN):
+        return  # shutdown began while the entries were unloading
+    cancels = hass.data.setdefault(KEY_RESUME_CANCELS, [])
+    cancel = async_call_later(hass, resume_after, _resume)
+    cancels.append(cancel)
 
 
 @callback

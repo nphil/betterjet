@@ -93,8 +93,30 @@ class FakeConfigEntries:
     def __init__(self) -> None:
         self.forwarded: list[tuple] = []
         self.unloaded: list[tuple] = []
+        self.entries: list = []
+        self.setup_calls: list[str] = []
+        # Set to an Event to make platform forwarding block.
+        self.forward_gate = None
+        self.on_forward = None
+
+    def async_entries(self, domain):
+        return list(self.entries)
+
+    async def async_unload(self, entry_id) -> bool:
+        for entry in self.entries:
+            if entry.entry_id == entry_id:
+                entry.state = bedjet_init.ConfigEntryState.NOT_LOADED
+        return True
+
+    async def async_setup(self, entry_id) -> bool:
+        self.setup_calls.append(entry_id)
+        return True
 
     async def async_forward_entry_setups(self, entry, platforms) -> None:
+        if self.on_forward is not None:
+            self.on_forward()
+        if self.forward_gate is not None:
+            await self.forward_gate.wait()
         self.forwarded.append((entry, tuple(platforms)))
 
     async def async_unload_platforms(self, entry, platforms) -> bool:
@@ -136,6 +158,8 @@ class FakeEntry:
         self.options: dict = {}
         self.title = "Bedjetty"
         self.runtime_data = None
+        self.entry_id = "entry-1"
+        self.state = bedjet_init.ConfigEntryState.LOADED
         self._unload_callbacks: list = []
 
     def async_on_unload(self, callback) -> None:
@@ -360,3 +384,100 @@ def test_shutdown_job_swallows_a_failing_release(monkeypatch, patched_bedjet) ->
 
     asyncio.run(hass.shutdown_jobs[0].target())  # must not raise
     assert device.released_for_shutdown is True
+
+
+def test_domain_latch_job_is_registered_once_by_async_setup() -> None:
+    hass = FakeHass()
+
+    assert asyncio.run(bedjet_init.async_setup(hass, {})) is True
+
+    assert len(hass.shutdown_jobs) == 1
+    asyncio.run(hass.shutdown_jobs[0].target())
+    assert hass.data[bedjet_init.KEY_SHUTTING_DOWN] is True
+
+
+def test_shutdown_job_is_registered_before_platform_forwarding(
+    monkeypatch, patched_bedjet
+) -> None:
+    # HA lists the shutdown jobs once when Stage 1 starts; a job added after
+    # the platform-forwarding await would be missed.
+    monkeypatch.setattr(
+        bedjet_init.bluetooth,
+        "async_last_service_info",
+        lambda hass, address, connectable=True: SimpleNamespace(
+            device=object(), advertisement=object(), source="proxy-1"
+        ),
+    )
+    hass = FakeHass()
+    seen: list[int] = []
+    hass.config_entries.on_forward = lambda: seen.append(len(hass.shutdown_jobs))
+
+    asyncio.run(bedjet_init.async_setup_entry(hass, FakeEntry()))
+
+    assert seen == [1]
+
+
+def test_setup_refuses_and_tears_down_when_shutdown_starts_during_start(
+    monkeypatch, patched_bedjet
+) -> None:
+    monkeypatch.setattr(
+        bedjet_init.bluetooth,
+        "async_last_service_info",
+        lambda hass, address, connectable=True: SimpleNamespace(
+            device=object(), advertisement=object(), source="proxy-1"
+        ),
+    )
+    hass = FakeHass()
+
+    async def start_during_shutdown(self) -> None:
+        self.started = True
+        hass.data[bedjet_init.KEY_SHUTTING_DOWN] = True
+
+    monkeypatch.setattr(FakeBedJet, "start", start_during_shutdown)
+
+    with pytest.raises(ConfigEntryNotReady):
+        asyncio.run(bedjet_init.async_setup_entry(hass, FakeEntry()))
+
+    assert FakeBedJet.instances[-1].released_for_shutdown is True
+    assert hass.config_entries.forwarded == []
+
+
+def test_domain_latch_cancels_a_pending_release_link_resume(monkeypatch) -> None:
+    cancelled: list[str] = []
+    timers: list = []
+
+    def fake_call_later(hass, delay, action):
+        timers.append(action)
+        return lambda: cancelled.append("cancelled")
+
+    monkeypatch.setattr(bedjet_init, "async_call_later", fake_call_later)
+    hass = FakeHass()
+    entry = FakeEntry()
+    hass.config_entries.entries = [entry]
+    asyncio.run(bedjet_init.async_setup(hass, {}))
+
+    asyncio.run(bedjet_init._async_release_links(hass, 1))
+    assert len(timers) == 1
+
+    # release_link unloaded the entry (its own shutdown job is gone); the
+    # domain job alone must still stop the pending resume.
+    asyncio.run(hass.shutdown_jobs[0].target())
+    assert cancelled == ["cancelled"]
+
+    # Even if the timer fires anyway, it must not set anything up.
+    asyncio.run(timers[0](None))
+    assert hass.config_entries.setup_calls == []
+
+
+def test_release_link_during_shutdown_schedules_no_resume(monkeypatch) -> None:
+    timers: list = []
+    monkeypatch.setattr(
+        bedjet_init, "async_call_later", lambda hass, delay, action: timers.append(action)
+    )
+    hass = FakeHass()
+    hass.config_entries.entries = [FakeEntry()]
+    hass.data[bedjet_init.KEY_SHUTTING_DOWN] = True
+
+    asyncio.run(bedjet_init._async_release_links(hass, 1))
+
+    assert timers == []
