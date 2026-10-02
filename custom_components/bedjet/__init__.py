@@ -245,7 +245,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> b
 # Home Assistant can order this itself: every entry registers a shutdown job
 # (see async_setup_entry) that releases the link in HA's first shutdown stage,
 # before the Bluetooth stack stops, so a plain restart no longer needs help.
-# This action stays as the manual/explicit path (`script.safe_restart` still
+# This action stays as the manual/explicit path (e.g. `script.ble_restart_proxy`
 # calls it) and also serves an operator who wants the slot freed right now.
 # ESPHome 2026.09.14 removed the proxy's on-API-loss release hook, and
 # rebooting a proxy is not a cure either - it re-rolls the dice (2026-09-17: 2
