@@ -111,6 +111,14 @@ def install() -> bool:
         def __init__(self, data=None):
             self.data = data or {}
 
+    class HassJob:
+        """Only what the shutdown-job registration reads: target and name."""
+
+        def __init__(self, target, name=None):
+            self.target = target
+            self.name = name
+
+    core.HassJob = HassJob
     core.ServiceCall = ServiceCall
     core.Event = Event
     core.CoreState = CoreState

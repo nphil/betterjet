@@ -47,6 +47,10 @@ Each step re-checks the link for up to 45 seconds (60 after a power cycle) befor
 
 "Healthy" here means connected *and* streaming: since the BedJet emits a status frame about four times a second for as long as a real link is held, a connection producing no frames is a wedged link, not a working one. Entities that still show their last known values are not evidence of a live link.
 
+## Restarting Home Assistant
+
+When Home Assistant shuts down or restarts, BetterJet hands the BedJet's Bluetooth connection back cleanly during Home Assistant's first shutdown step, while Bluetooth is still running. This stops a restart from leaving a "ghost" connection stuck on a Bluetooth proxy, so the BedJet is free to reconnect straight away afterwards. Nothing is unloaded and no entities are removed; only the link is released. The `bedjet.release_link` action still works if you want to free the connection manually.
+
 ## Installation
 
 ### HACS (recommended)

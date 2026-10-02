@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 
 import bleak_retry_connector
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
-from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
+from homeassistant.const import CONF_ADDRESS, Platform
+from homeassistant.core import HassJob, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.util import dt as dt_util
 
@@ -35,6 +37,13 @@ PLATFORMS: list[Platform] = [
 
 _LOGGER = logging.getLogger(__name__)
 
+# Upper bound for one entry's shutdown release. Home Assistant runs all
+# shutdown jobs concurrently under a single 20 s budget.
+SHUTDOWN_RELEASE_TIMEOUT_S = 8
+# hass.data flag set by the first shutdown job: once true this process never
+# sets an entry up (or resumes one after release_link) again.
+KEY_SHUTTING_DOWN = f"{DOMAIN}_shutting_down"
+
 type BedJetConfigEntry = ConfigEntry[BedJetCoordinator]
 
 
@@ -56,6 +65,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
     retries setup on its own backoff for as long as the device stays silent;
     entities simply report unavailable until an advertisement arrives.
     """
+    if hass.data.get(KEY_SHUTTING_DOWN):
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
     _async_register_services(hass)
     address: str = entry.data[CONF_ADDRESS]
     service_info = bluetooth.async_last_service_info(hass, address, connectable=True)
@@ -128,12 +139,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> bo
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    async def _async_stop(event: Event) -> None:
-        """Release the BLE connection on Home Assistant stop."""
-        await device.stop()
+    async def _async_release_at_shutdown() -> None:
+        """Drop the held BLE link while Home Assistant and Bluetooth are alive.
+
+        Runs as a Home Assistant shutdown job, i.e. before the STOP event that
+        tears the Bluetooth stack down. Releases the link only: the entry stays
+        loaded (no entity churn). Bounded, never raises.
+        """
+        hass.data[KEY_SHUTTING_DOWN] = True
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(SHUTDOWN_RELEASE_TIMEOUT_S):
+                await device.release_for_shutdown()
+        except asyncio.CancelledError:
+            raise  # Home Assistant itself gave up on the job; not ours to eat
+        except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+            _LOGGER.warning(
+                "Could not release BLE link to %s at shutdown within %.0f s: %r",
+                entry.title,
+                SHUTDOWN_RELEASE_TIMEOUT_S,
+                err,
+            )
+            return
+        _LOGGER.info(
+            "Released BLE link to %s at shutdown in %.2f s",
+            entry.title,
+            time.monotonic() - started,
+        )
 
     entry.async_on_unload(
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop)
+        hass.async_add_shutdown_job(
+            HassJob(_async_release_at_shutdown, f"bedjet release BLE link {entry.title}")
+        )
     )
     return True
 
@@ -158,22 +195,23 @@ async def async_unload_entry(hass: HomeAssistant, entry: BedJetConfigEntry) -> b
 # slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
 # rebooting the proxy holding each stale link freed them).
 #
-# Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
-# on-API-loss release hook, and rebooting a proxy is not a cure either - it
-# re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
-# post-reboot connection). The only clean path is to drop the link while HA and
-# its Bluetooth stack are both still alive, which is what this action does:
-# `script.safe_restart` calls it on every BLE integration and only then restarts
-# Core. Implemented by unloading the entry, because async_unload_entry already
-# runs the coordinator's async_shutdown, which unregisters the device callback
-# and drops the single connection this device allows. Anything gentler leaves
-# that one slot occupied. A ghost that forms anyway is caught by
-# `automation.ble_ghost_link_detector` and freed with the holding proxy's
-# `force_disconnect_orphan` action (HCI disconnect by handle).
+# Home Assistant can order this itself: every entry registers a shutdown job
+# (see async_setup_entry) that releases the link in HA's first shutdown stage,
+# before the Bluetooth stack stops, so a plain restart no longer needs help.
+# This action stays as the manual/explicit path (`script.safe_restart` still
+# calls it) and also serves an operator who wants the slot freed right now.
+# ESPHome 2026.09.14 removed the proxy's on-API-loss release hook, and
+# rebooting a proxy is not a cure either - it re-rolls the dice (2026-09-17: 2
+# of 6 proxies re-ghosted on their first post-reboot connection). Implemented
+# by unloading the entry, because async_unload_entry already runs the
+# coordinator's async_shutdown, which unregisters the device callback and drops
+# the single connection this device allows. A ghost that forms anyway is
+# caught by `automation.ble_ghost_link_detector` and freed with the holding
+# proxy's `force_disconnect_orphan` action (HCI disconnect by handle).
 #
 # `resume_after` sets the entry up again if no restart follows, so an operator
-# who calls this and changes their mind is not left with a dead device that
-# would raise its own unreachable repair a quarter of an hour later.
+# who calls this and changes their mind is not left with a dead device. Once
+# the shutdown job has run, resuming is refused for the rest of the process.
 SERVICE_RELEASE_LINK = "release_link"
 ATTR_RESUME_AFTER = "resume_after"
 DEFAULT_RESUME_AFTER = 180
@@ -203,6 +241,8 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
 
     async def _resume(_now: Any) -> None:
         for entry in released:
+            if hass.data.get(KEY_SHUTTING_DOWN):
+                return  # shutdown already released the links for good
             if entry.state is ConfigEntryState.LOADED:
                 continue  # something set it up already; it owns itself now
             with contextlib.suppress(Exception):

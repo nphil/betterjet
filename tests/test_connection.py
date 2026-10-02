@@ -602,3 +602,94 @@ class TestDropAccounting:
             await bedjet.stop()
 
         asyncio.run(scenario())
+
+
+class TestReleaseForShutdown:
+    """Home Assistant's shutdown job: release the link, then never connect again."""
+
+    def test_disconnects_and_refuses_every_path_back_to_a_connection(
+        self, factory, fast_backoff
+    ) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            assert bedjet.connected is True
+            client = factory.last
+            fired: list[BedJet] = []
+            bedjet.register_callback(fired.append)
+
+            await bedjet.release_for_shutdown()
+
+            assert client.disconnect_calls == 1
+            assert bedjet.connected is False
+            # A deliberate release is not published (no wave of state writes).
+            assert fired == []
+            # The user's hold setting is untouched.
+            assert bedjet.hold_connection is True
+
+            # An advertisement (the slot looks free), a re-hold request and a
+            # fresh start() must all be refused.
+            bedjet.set_ble_device_and_advertisement_data(
+                make_ble_device(), make_advertisement_data()
+            )
+            bedjet.hold_connection = False
+            bedjet.hold_connection = True
+            await bedjet.start()
+            await _pump(20)
+            assert len(factory.clients) == 1
+            assert bedjet.connected is False
+            with pytest.raises(BedJetConnectionError):
+                await bedjet.set_mode(BedJetMode.HEAT)
+
+        asyncio.run(scenario())
+
+    def test_refused_even_while_a_reconnect_backoff_is_pending(
+        self, factory, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(pb, "reconnect_backoff_seconds", lambda attempt, rng=None: 0.05)
+
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            factory.last.simulate_disconnect()  # link lost; supervisor now backing off
+            FakeBleakClient.fail_next_connects = 1
+            await _pump()
+            before = len(factory.clients)
+
+            await bedjet.release_for_shutdown()
+            await asyncio.sleep(0.2)  # several backoff periods
+
+            assert len(factory.clients) == before
+            assert bedjet.connected is False
+
+        asyncio.run(scenario())
+
+    def test_hanging_disconnect_is_bounded_by_the_callers_timeout(
+        self, factory, fast_backoff
+    ) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            hang = asyncio.Event()
+
+            async def never_returns() -> bool:
+                await hang.wait()
+                return True
+
+            factory.last.disconnect = never_returns  # type: ignore[method-assign]
+
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.05):
+                    await bedjet.release_for_shutdown()
+
+            # Latched even though the disconnect never completed.
+            bedjet.set_ble_device_and_advertisement_data(
+                make_ble_device(), make_advertisement_data()
+            )
+            await _pump(20)
+            assert len(factory.clients) == 1
+
+        asyncio.run(scenario())

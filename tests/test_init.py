@@ -38,6 +38,10 @@ class FakeBedJet:
         self.clock = clock
         self.started = False
         self.stopped = False
+        self.released_for_shutdown = False
+        # Set to an Event to make the shutdown release hang, or an exception
+        # to make it fail.
+        self.release_blocker = None
         self.callbacks: list = []
         self.set_ble_calls: list[tuple] = []
         self.state = SimpleNamespace(sentinel=True)
@@ -63,6 +67,14 @@ class FakeBedJet:
 
     async def stop(self) -> None:
         self.stopped = True
+
+    async def release_for_shutdown(self) -> None:
+        self.released_for_shutdown = True
+        blocker = self.release_blocker
+        if isinstance(blocker, Exception):
+            raise blocker
+        if blocker is not None:
+            await blocker.wait()
 
     def set_ble_device_and_advertisement_data(self, device, adv, *, source=None) -> None:
         self.set_ble_calls.append((device, adv, source))
@@ -111,6 +123,11 @@ class FakeHass:
         self.config_entries = FakeConfigEntries()
         # The `device_unreachable` outage clock lives here, keyed by address.
         self.data: dict = {}
+        self.shutdown_jobs: list = []
+
+    def async_add_shutdown_job(self, job):
+        self.shutdown_jobs.append(job)
+        return lambda: self.shutdown_jobs.remove(job)
 
 
 class FakeEntry:
@@ -278,3 +295,68 @@ def test_setup_builds_an_affinity_client_class_when_habluetooth_supports_it(
     assert client_class is not None
     assert client_class is not FakeBaseWithHooks
     assert issubclass(client_class, FakeBaseWithHooks)
+
+
+def _setup(monkeypatch, patched_bedjet):
+    monkeypatch.setattr(
+        bedjet_init.bluetooth,
+        "async_last_service_info",
+        lambda hass, address, connectable=True: SimpleNamespace(
+            device=object(), advertisement=object(), source="proxy-1"
+        ),
+    )
+    hass = FakeHass()
+    entry = FakeEntry()
+    assert asyncio.run(bedjet_init.async_setup_entry(hass, entry)) is True
+    return hass, entry, FakeBedJet.instances[-1]
+
+
+def test_each_entry_registers_one_shutdown_job_removed_on_unload(
+    monkeypatch, patched_bedjet
+) -> None:
+    hass, entry, _device = _setup(monkeypatch, patched_bedjet)
+    assert len(hass.shutdown_jobs) == 1
+    # No STOP-event listener competes with the shutdown job any more.
+    assert hass.bus.listeners == []
+
+    for unload in entry._unload_callbacks:
+        unload()
+
+    assert hass.shutdown_jobs == []
+
+
+def test_shutdown_job_releases_the_link_and_refuses_later_setup(
+    monkeypatch, patched_bedjet
+) -> None:
+    hass, entry, device = _setup(monkeypatch, patched_bedjet)
+
+    asyncio.run(hass.shutdown_jobs[0].target())
+
+    assert device.released_for_shutdown is True
+    # Entry is not unloaded: only the link is released.
+    assert device.stopped is False
+    assert hass.config_entries.unloaded == []
+    # Nothing in this process may set a BedJet up (and so connect) afterwards.
+    with pytest.raises(ConfigEntryNotReady):
+        asyncio.run(bedjet_init.async_setup_entry(hass, FakeEntry()))
+
+
+def test_shutdown_job_is_bounded_when_the_disconnect_hangs(
+    monkeypatch, patched_bedjet
+) -> None:
+    monkeypatch.setattr(bedjet_init, "SHUTDOWN_RELEASE_TIMEOUT_S", 0.05)
+    hass, _entry, device = _setup(monkeypatch, patched_bedjet)
+
+    async def scenario() -> None:
+        device.release_blocker = asyncio.Event()  # never set
+        await asyncio.wait_for(hass.shutdown_jobs[0].target(), timeout=2)
+
+    asyncio.run(scenario())  # returns; does not raise
+
+
+def test_shutdown_job_swallows_a_failing_release(monkeypatch, patched_bedjet) -> None:
+    hass, _entry, device = _setup(monkeypatch, patched_bedjet)
+    device.release_blocker = RuntimeError("proxy went away")
+
+    asyncio.run(hass.shutdown_jobs[0].target())  # must not raise
+    assert device.released_for_shutdown is True

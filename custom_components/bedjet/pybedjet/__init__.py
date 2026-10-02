@@ -329,6 +329,9 @@ class BedJet:
 
         self._started = False
         self._stopped = True
+        # Process-lifetime latch set by release_for_shutdown(); unlike
+        # _stopped it is never cleared, so nothing can reconnect afterwards.
+        self._closing = False
         self._reconnect_attempt = 0
         self._connect_wakeup = asyncio.Event()
         self._drops = DropTracker()
@@ -427,6 +430,8 @@ class BedJet:
 
     @hold_connection.setter
     def hold_connection(self, value: bool) -> None:
+        if self._closing and value:
+            return  # the shutdown latch outranks any request to hold the link
         if value == self._hold_connection:
             return
         self._hold_connection = value
@@ -474,6 +479,8 @@ class BedJet:
         return unregister
 
     def _fire_callbacks(self) -> None:
+        if self._closing:
+            return
         for callback in list(self._callbacks):
             try:
                 callback(self)
@@ -485,11 +492,13 @@ class BedJet:
     async def start(self) -> None:
         """Begin the connection lifecycle. Idempotent; returns promptly.
 
+        Refused for good once `release_for_shutdown()` has latched.
+
         Never blocks on, or raises for, the device not being reachable right
         now - it only arranges to keep trying (advertisement-triggered, with
         backoff) until `stop()` or `hold_connection = False`.
         """
-        if self._started:
+        if self._started or self._closing:
             return
         self._started = True
         self._stopped = False
@@ -502,17 +511,40 @@ class BedJet:
         """Stop the connection lifecycle and disconnect. Idempotent."""
         self._stopped = True
         self._connect_wakeup.set()
+        await self._cancel_background_tasks()
+        await self._disconnect()
+        self._started = False
+
+    async def release_for_shutdown(self) -> None:
+        """Drop the held link for good because Home Assistant is going away.
+
+        Sets the closing latch FIRST (synchronously), so every path that could
+        open a connection - supervisor, reconnect backoff, advertisement
+        wakeups, watchdog, commands, `hold_connection = True`, `start()` -
+        refuses from then on; then cancels the background tasks and completes
+        a GATT disconnect. Observers are not notified: this is a deliberate
+        release, not a state change worth publishing, and `hold_connection`
+        is left as the user set it. Caller bounds the time it may take.
+        """
+        self._closing = True
+        self._stopped = True
+        self._connect_wakeup.set()
+        await self._cancel_background_tasks()
+        await self._disconnect()
+        self._started = False
+
+    async def _cancel_background_tasks(self) -> None:
         tasks = [t for t in (self._connect_task, self._watchdog_task, self._release_task) if t is not None]
         for task in tasks:
             task.cancel()
-        for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        if tasks:
+            # asyncio.wait, not awaiting each task: it never re-raises a
+            # task's CancelledError, so a caller's own cancellation (the
+            # shutdown timeout) cannot be mistaken for one and swallowed.
+            await asyncio.wait(tasks)
         self._connect_task = None
         self._watchdog_task = None
         self._release_task = None
-        await self._disconnect()
-        self._started = False
 
     # -- commands ---------------------------------------------------------
     # Every command awaits a confirming frame (never optimistic local state)
@@ -605,6 +637,8 @@ class BedJet:
         await self._run_command(build_command(BedJetCommand.BUTTON, BedJetButton.UPDATE_FIRMWARE), _any_frame)
 
     async def _run_command(self, command_bytes: bytes, predicate: Callable[[BedJetState], bool]) -> None:
+        if self._closing:
+            raise BedJetConnectionError(f"{self.address}: Home Assistant is shutting down")
         if self._client is None or not self._client.is_connected:
             raise BedJetConnectionError(f"{self.address}: not connected")
         loop = asyncio.get_running_loop()
@@ -710,6 +744,8 @@ class BedJet:
                 await self._connect_wakeup.wait()
 
     async def _connect_once(self) -> None:
+        if self._closing:
+            raise BedJetConnectionError(f"{self.address}: Home Assistant is shutting down")
         async with asyncio.timeout(CONNECT_ATTEMPT_TIMEOUT_S):
             client = await establish_connection(
                 self._client_class,
