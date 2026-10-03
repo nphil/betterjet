@@ -134,9 +134,12 @@ TAIL_MAX_AGE_S = 15.0
 # publishes immediately regardless of this limit - see `is_meaningful_change`.
 PUBLISH_MIN_INTERVAL_S = 2.0
 
-# Upper bound on one connect+discover+subscribe attempt, so a hung transport
-# (e.g. a misbehaving proxy hop) cannot park the reconnect supervisor forever.
-CONNECT_ATTEMPT_TIMEOUT_S = 60.0
+# Upper bound on ONE connect or subscribe step (startup contract S4): a hung
+# transport (e.g. a busy or misbehaving proxy hop) must fail fast so the
+# reconnect supervisor can retry, instead of parking on a step the lower
+# library never times out. Applied separately to establish_connection,
+# start_notify, every GATT write and the disconnect handshake.
+GATT_STEP_TIMEOUT_S = 10.0
 
 # Best-effort memory-name read retry budget (matches the prior fork's `tag <
 # 2` loop bound).
@@ -646,7 +649,8 @@ class BedJet:
         entry = (predicate, future)
         self._pending.append(entry)
         try:
-            await self._client.write_gatt_char(COMMAND_UUID, command_bytes, response=False)
+            async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
+                await self._client.write_gatt_char(COMMAND_UUID, command_bytes, response=False)
             self._tail_refresh_needed = True
             async with asyncio.timeout(COMMAND_TIMEOUT_S):
                 await future
@@ -746,7 +750,7 @@ class BedJet:
     async def _connect_once(self) -> None:
         if self._closing:
             raise BedJetConnectionError(f"{self.address}: Home Assistant is shutting down")
-        async with asyncio.timeout(CONNECT_ATTEMPT_TIMEOUT_S):
+        async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
             client = await establish_connection(
                 self._client_class,
                 self._ble_device,
@@ -755,12 +759,14 @@ class BedJet:
                 use_services_cache=True,
                 ble_device_callback=lambda: self._ble_device,
             )
-            try:
+        try:
+            async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
                 await client.start_notify(STATUS_UUID, self._handle_notify)
-            except BaseException:
-                with contextlib.suppress(BleakError, OSError, EOFError):
+        except BaseException:
+            with contextlib.suppress(BleakError, OSError, EOFError, TimeoutError):
+                async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
                     await client.disconnect()
-                raise
+            raise
 
         self._client = client
         self._last_frame_at = _monotonic()
@@ -820,10 +826,12 @@ class BedJet:
         if self._bio_read_task is not None:
             self._bio_read_task.cancel()
         if client.is_connected:
-            with contextlib.suppress(BleakError, OSError, EOFError):
-                await client.stop_notify(STATUS_UUID)
-            with contextlib.suppress(BleakError, OSError, EOFError):
-                await client.disconnect()
+            with contextlib.suppress(BleakError, OSError, EOFError, TimeoutError):
+                async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
+                    await client.stop_notify(STATUS_UUID)
+            with contextlib.suppress(BleakError, OSError, EOFError, TimeoutError):
+                async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
+                    await client.disconnect()
         self._fail_pending(BedJetConnectionError(f"{self.address}: disconnected"))
         self._fire_callbacks()
 

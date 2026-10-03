@@ -13,6 +13,7 @@ on genuinely-pending asyncio tasks, never a real multi-second/minute delay.
 from __future__ import annotations
 
 import asyncio
+import datetime
 
 import pytest
 
@@ -693,3 +694,122 @@ class TestReleaseForShutdown:
             assert len(factory.clients) == 1
 
         asyncio.run(scenario())
+
+
+class TestStuckStepsFailFast:
+    """Startup contract S4: no single connect/subscribe/write/disconnect step
+    may park the library forever, even though bleak has no timeout of its own.
+    The real limit is 10 s; tests shrink it so only pending tasks are awaited.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_step_timeout(self, monkeypatch, fast_backoff):
+        monkeypatch.setattr(pb, "GATT_STEP_TIMEOUT_S", 0.05)
+
+    def test_start_returns_at_once_and_hung_connect_recovers_with_data(
+        self, factory, monkeypatch
+    ) -> None:
+        """Setup never waits (a); a connect that hangs is abandoned and the
+        retry connects, and data arriving long after start() populates state (b)."""
+        real_establish = make_fake_establish_connection(factory)
+        calls = 0
+
+        async def hang_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                await asyncio.Event().wait()  # never answers
+            return await real_establish(*args, **kwargs)
+
+        monkeypatch.setattr(pb, "establish_connection", hang_once)
+
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            events: list[int] = []
+            bedjet.register_callback(lambda _d: events.append(1))
+            async with asyncio.timeout(0.02):  # far below the step timeout
+                await bedjet.start()
+            assert bedjet.connected is False
+            assert bedjet.state is None
+
+            await asyncio.wait_for(_until(lambda: bedjet.connected), timeout=1.0)
+            assert calls == 2
+            factory.last.notify(
+                BEDJET_STATUS_UUID, build_notify_frame(mode=int(BedJetMode.HEAT))
+            )
+            assert bedjet.state.mode is BedJetMode.HEAT
+            assert events
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_hung_subscribe_is_abandoned_and_link_released(self, factory, monkeypatch) -> None:
+        subscribe_calls = 0
+        original = FakeBleakClient.start_notify
+
+        async def hang_first(self, *args, **kwargs):
+            nonlocal subscribe_calls
+            subscribe_calls += 1
+            if subscribe_calls == 1:
+                await asyncio.Event().wait()
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(FakeBleakClient, "start_notify", hang_first)
+
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await asyncio.wait_for(_until(lambda: bedjet.connected), timeout=1.0)
+            assert subscribe_calls == 2
+            assert factory.clients[0].disconnect_calls == 1  # stuck link not leaked
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_hung_clock_write_does_not_park_the_supervisor(self, factory, monkeypatch) -> None:
+        original = FakeBleakClient.write_gatt_char
+
+        async def hang_write(self, *args, **kwargs):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(FakeBleakClient, "write_gatt_char", hang_write)
+
+        async def scenario() -> None:
+            bedjet = BedJet(
+                make_ble_device(),
+                make_advertisement_data(),
+                hold_connection=True,
+                clock=lambda: datetime.datetime(2026, 1, 1, 12, 0),
+            )
+            await bedjet.start()
+            # The post-connect clock write hangs; the connect attempt must
+            # still finish (and go on to the memory-name read) after the
+            # step timeout instead of parking the supervisor forever.
+            await asyncio.wait_for(
+                _until(lambda: bedjet._bio_read_task is not None), timeout=1.0
+            )
+            monkeypatch.setattr(FakeBleakClient, "write_gatt_char", original)
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
+    def test_hung_disconnect_is_bounded_without_a_caller_timeout(self, factory) -> None:
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await _pump()
+            hang = asyncio.Event()
+
+            async def never_returns() -> bool:
+                await hang.wait()
+                return True
+
+            factory.last.disconnect = never_returns  # type: ignore[method-assign]
+            await asyncio.wait_for(bedjet.stop(), timeout=1.0)  # must not hang
+
+        asyncio.run(scenario())
+
+
+async def _until(predicate) -> None:
+    while not predicate():
+        await asyncio.sleep(0.005)
