@@ -141,6 +141,15 @@ PUBLISH_MIN_INTERVAL_S = 2.0
 # start_notify, every GATT write and the disconnect handshake.
 GATT_STEP_TIMEOUT_S = 10.0
 
+# Backend-level timeout (seconds) handed to bleak's start_notify / read_gatt_char
+# (startup contract S8). It is deliberately SHORTER than GATT_STEP_TIMEOUT_S so
+# the ESPHome proxy backend's own error path runs and unregisters its
+# notification handler; cancelling a stalled subscribe from outside would leave
+# an abandoned handler registered on the proxy. start_notify needs up to two
+# round-trips (subscribe + descriptor write), so 2 x 4 s < 10 s. Backends that
+# do not know the kwarg ignore it.
+BACKEND_GATT_TIMEOUT_S = 4.0
+
 # Best-effort memory-name read retry budget (matches the prior fork's `tag <
 # 2` loop bound).
 BIO_READ_ATTEMPTS = 2
@@ -761,11 +770,13 @@ class BedJet:
             )
         try:
             async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
-                await client.start_notify(STATUS_UUID, self._handle_notify)
+                await client.start_notify(
+                    STATUS_UUID, self._handle_notify, timeout=BACKEND_GATT_TIMEOUT_S
+                )
         except BaseException:
             with contextlib.suppress(BleakError, OSError, EOFError, TimeoutError):
                 async with asyncio.timeout(GATT_STEP_TIMEOUT_S):
-                    await client.disconnect()
+                    await asyncio.shield(client.disconnect())
             raise
 
         self._client = client
@@ -878,7 +889,7 @@ class BedJet:
         if client is None or not client.is_connected:
             return
         try:
-            data = await client.read_gatt_char(STATUS_UUID)
+            data = await client.read_gatt_char(STATUS_UUID, timeout=BACKEND_GATT_TIMEOUT_S)
         except (BleakError, OSError, EOFError) as err:
             _LOGGER.debug("%s: tail read failed: %s", self.address, err)
             return
@@ -971,7 +982,9 @@ class BedJet:
                     build_command(BedJetCommand.GET_BIO, BioDataRequest.MEMORY_NAMES, attempt),
                     response=False,
                 )
-                data = await client.read_gatt_char(BIODATA_FULL_UUID)
+                data = await client.read_gatt_char(
+                    BIODATA_FULL_UUID, timeout=BACKEND_GATT_TIMEOUT_S
+                )
             except (BleakError, OSError, EOFError) as err:
                 _LOGGER.debug("%s: memory-name read attempt %d failed: %s", self.address, attempt, err)
                 continue

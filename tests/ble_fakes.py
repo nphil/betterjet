@@ -98,6 +98,8 @@ class FakeBleakClient:
         self._connected = False
         self.writes: list[bytes] = []
         self.reads: list[str] = []
+        self.read_kwargs: list[dict[str, Any]] = []
+        self.notify_kwargs: list[dict[str, Any]] = []
         self._notify_callbacks: dict[str, Callable[[BleakGATTCharacteristic, bytearray], None]] = {}
         self._char_values: dict[str, bytes] = {}
         self.connect_calls = 0
@@ -130,9 +132,10 @@ class FakeBleakClient:
             raise BleakError("Not connected")
         self.writes.append(bytes(data))
 
-    async def read_gatt_char(self, char_specifier: str) -> bytearray:
+    async def read_gatt_char(self, char_specifier: str, **kwargs: Any) -> bytearray:
         if not self._connected:
             raise BleakError("Not connected")
+        self.read_kwargs.append(kwargs)
         self.reads.append(char_specifier)
         return bytearray(self._char_values.get(char_specifier, b""))
 
@@ -142,6 +145,7 @@ class FakeBleakClient:
         callback: Callable[[BleakGATTCharacteristic, bytearray], None],
         **kwargs: Any,
     ) -> None:
+        self.notify_kwargs.append(kwargs)
         self._notify_callbacks[char_specifier] = callback
 
     async def stop_notify(self, char_specifier: str) -> None:

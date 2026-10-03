@@ -766,6 +766,46 @@ class TestStuckStepsFailFast:
 
         asyncio.run(scenario())
 
+    def test_subscribe_passes_a_backend_timeout_below_the_outer_guard(
+        self, factory, monkeypatch
+    ) -> None:
+        """S8: a proxy subscribe that never acknowledges must be ended by the
+        backend's own timeout (so its error path unregisters the handler), not
+        by cancelling it from outside. The fake honours the kwarg like
+        bleak-esphome does; the outer guard is left long so only the backend
+        timeout can end the stall."""
+        monkeypatch.setattr(pb, "GATT_STEP_TIMEOUT_S", 5.0)
+        monkeypatch.setattr(pb, "BACKEND_GATT_TIMEOUT_S", 0.05)
+        assert pb.BACKEND_GATT_TIMEOUT_S < pb.GATT_STEP_TIMEOUT_S
+        error_path_ran: list[int] = []
+        original = FakeBleakClient.start_notify
+        calls = 0
+
+        async def stalls_until_backend_timeout(self, char, callback, **kwargs):
+            nonlocal calls
+            calls += 1
+            self.notify_kwargs.append(kwargs)
+            if calls == 1:
+                try:
+                    await asyncio.wait_for(asyncio.Event().wait(), kwargs["timeout"])
+                except TimeoutError:
+                    error_path_ran.append(1)  # handler removal would run here
+                    raise
+            return await original(self, char, callback, **kwargs)
+
+        monkeypatch.setattr(FakeBleakClient, "start_notify", stalls_until_backend_timeout)
+
+        async def scenario() -> None:
+            bedjet = make_bedjet(hold_connection=True)
+            await bedjet.start()
+            await asyncio.wait_for(_until(lambda: bedjet.connected), timeout=1.0)
+            assert error_path_ran == [1]
+            assert factory.clients[0].notify_kwargs[0]["timeout"] == 0.05
+            assert factory.last.notify_kwargs[-1]["timeout"] == 0.05
+            await bedjet.stop()
+
+        asyncio.run(scenario())
+
     def test_hung_clock_write_does_not_park_the_supervisor(self, factory, monkeypatch) -> None:
         original = FakeBleakClient.write_gatt_char
 
@@ -808,6 +848,12 @@ class TestStuckStepsFailFast:
             await asyncio.wait_for(bedjet.stop(), timeout=1.0)  # must not hang
 
         asyncio.run(scenario())
+
+
+def test_shipped_backend_timeouts_fit_inside_the_outer_guard() -> None:
+    # Two proxy round-trips (subscribe + descriptor write) must finish inside
+    # the outer guard, using the real shipped constants.
+    assert 2 * pb.BACKEND_GATT_TIMEOUT_S < pb.GATT_STEP_TIMEOUT_S
 
 
 async def _until(predicate) -> None:
