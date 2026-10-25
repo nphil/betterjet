@@ -214,7 +214,7 @@ class TestOptionsFlow:
         assert result["type"] == "form"
         assert result["step_id"] == "init"
         selector = result["data_schema"].schema[CONF_PREFERRED_PROXY]
-        assert selector.config["options"] == [
+        assert [o["value"] for o in selector.config["options"]] == [
             "",
             "attic-bluetooth-proxy",
             "plant-room-bluetooth-proxy",
@@ -231,7 +231,7 @@ class TestOptionsFlow:
         result = asyncio.run(flow.async_step_init())
 
         selector = result["data_schema"].schema[CONF_PREFERRED_PROXY]
-        assert selector.config["options"] == ["", "offline-proxy"]
+        assert [o["value"] for o in selector.config["options"]] == ["", "offline-proxy"]
 
     def test_submitting_creates_the_entry_with_exactly_the_chosen_value(
         self, monkeypatch

@@ -718,6 +718,10 @@ def install() -> bool:
 
     event.async_call_later = async_call_later
 
+    config_validation = _module("homeassistant.helpers.config_validation")
+    helpers.config_validation = config_validation
+    config_validation.config_entry_only_config_schema = lambda domain: None
+
     selector = _module("homeassistant.helpers.selector")
     helpers.selector = selector
 
@@ -758,6 +762,13 @@ def install() -> bool:
         def __call__(self, data):
             return data
 
+    class SelectOptionDict(dict):
+        """Real type is a TypedDict; a plain dict is a faithful stand-in."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+
+    selector.SelectOptionDict = SelectOptionDict
     selector.SelectSelectorConfig = SelectSelectorConfig
     selector.SelectSelectorMode = SelectSelectorMode
     selector.SelectSelector = SelectSelector
