@@ -22,8 +22,11 @@ from .coordinator import BedJetCoordinator
 from .pybedjet import BedJet
 import contextlib
 import voluptuous as vol
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_call_later
 from typing import Any
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,

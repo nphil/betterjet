@@ -105,10 +105,15 @@
       }
     }
   },
-  "selector": {
-    "preferred_proxy": {
-      "options": {
-        "": "Automatic (strongest signal)"
+  "services": {
+    "release_link": {
+      "name": "Release link",
+      "description": "Disconnects every BedJet so another device can connect, then reconnects after a delay.",
+      "fields": {
+        "resume_after": {
+          "name": "Resume after",
+          "description": "Seconds to wait before reconnecting (0 = stay released)."
+        }
       }
     }
   }

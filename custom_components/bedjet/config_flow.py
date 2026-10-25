@@ -17,6 +17,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.helpers.selector import (
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -228,10 +229,19 @@ class OptionsFlowHandler(OptionsFlowBase):
                 {
                     vol.Optional(CONF_PREFERRED_PROXY, default=current): SelectSelector(
                         SelectSelectorConfig(
-                            options=["", *sorted(proxies)],
+                            # "" (automatic) is labelled inline: an empty
+                            # string is not a valid translation key.
+                            options=[
+                                SelectOptionDict(
+                                    value="", label="Automatic (strongest signal)"
+                                ),
+                                *(
+                                    SelectOptionDict(value=p, label=p)
+                                    for p in sorted(proxies)
+                                ),
+                            ],
                             mode=SelectSelectorMode.DROPDOWN,
                             custom_value=True,
-                            translation_key=CONF_PREFERRED_PROXY,
                         )
                     ),
                 }

@@ -1,0 +1,9 @@
+release_link:
+  fields:
+    resume_after:
+      default: 180
+      selector:
+        number:
+          min: 0
+          max: 900
+          unit_of_measurement: s
